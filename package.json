@@ -1,0 +1,64 @@
+{
+  "name": "c8y-realtime",
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "description": "A Web API compatible real-time client for Cumulocity IoT with hook-based event subscriptions",
+  "keywords": [
+    "cumulocity",
+    "realtime",
+    "websocket",
+    "iot",
+    "notifications",
+    "typescript"
+  ],
+  "license": "MIT",
+  "author": "schplitt",
+  "homepage": "https://github.com/schplitt/c8y-realtime#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/schplitt/c8y-realtime.git"
+  },
+  "bugs": {
+    "url": "https://github.com/schplitt/c8y-realtime/issues"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    }
+  },
+  "main": "./dist/index.mjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.mts",
+  "files": [
+    "LICENSE",
+    "README.md",
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "typecheck": "tsc --noEmit",
+    "prerelease": "eslint && tsc --noEmit && tsdown",
+    "release": "bumpp",
+    "test": "vitest",
+    "test:run": "vitest run"
+  },
+  "dependencies": {
+    "better-result": "catalog:",
+    "hookable": "catalog:"
+  },
+  "devDependencies": {
+    "@schplitt/eslint-config": "catalog:",
+    "bumpp": "catalog:",
+    "eslint": "catalog:",
+    "tsdown": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,16 @@
+catalogMode: prefer
+
+shellEmulator: true
+
+trustPolicy: no-downgrade
+catalog:
+  '@schplitt/eslint-config': ^1.2.0
+  better-result: ^2.7.0
+  bumpp: ^10.4.0
+  eslint: ^9.39.2
+  hookable: ^6.0.1
+  tsdown: ^0.20.1
+  typescript: ^5.9.3
+  vitest: ^4.0.18
+onlyBuiltDependencies:
+  - esbuild
