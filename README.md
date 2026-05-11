@@ -80,8 +80,11 @@ unhook()
 # Install dependencies
 pnpm install
 
-# Run tests once
+# Run all tests once
 pnpm test:run
+
+# Run only the optional real-tenant integration tests
+pnpm test:integration
 
 # Build
 pnpm build
@@ -92,6 +95,24 @@ pnpm lint
 # Type check
 pnpm typecheck
 ```
+
+## Real-tenant integration tests
+
+The repository includes an optional Vitest integration test that exercises `C8YBayeuxConnection` directly against a real Cumulocity tenant.
+
+Set these environment variables in your shell or in a local `.env` file before running `pnpm test:run` or `pnpm test:integration`:
+
+```sh
+export C8Y_REALTIME_URL='wss://your-tenant.example.com/notification/realtime'
+export C8Y_REALTIME_TENANT='t12345'
+export C8Y_REALTIME_USER='your-user'
+export C8Y_REALTIME_PASSWORD='your-password'
+```
+
+Behavior:
+
+- If any required environment variable is missing, the real-tenant test is skipped with Vitest's built-in `it.skipIf(...)`.
+- If the test runs and fails, it fails normally.
 
 ## License
 

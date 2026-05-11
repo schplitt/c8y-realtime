@@ -232,24 +232,22 @@ pnpm release    # Version/tag workflow helper via bumpp
 
 ### Current status
 
-The repository currently has **no test files yet**. When adding functionality, add tests along with it.
+The repository currently keeps a single optional real-tenant integration test under `tests/integration/`.
 
 ### Test expectations
 
 - Put tests under `tests/`
 - Use `*.test.ts` naming
 - Import from `../src` or `../../src` depending on location
-- Prefer unit tests for:
-  - channel builders
-  - Bayeux message helpers
-  - reconnect state logic
-  - subscription deduplication
-  - message routing
-- Add integration-style tests for:
-  - handshake/connect flow
-  - reconnect and resubscribe behavior
-  - socket loss recovery
-  - auth and handshake edge cases
+- Put tests under `tests/`
+- Use `*.test.ts` naming
+- Import from `../src` or `../../src` depending on location
+- Real-tenant integration tests may use environment variables and should:
+  - live under `tests/integration/`
+  - exercise the actual `C8YBayeuxConnection` flow rather than raw WebSocket smoke tests
+  - load tenant credentials from shell env or a local `.env` file when configured to do so
+  - skip with Vitest's built-in conditional skip when required tenant credentials are not present
+  - fail normally when the external tenant check itself fails
 
 ### Automation rule
 
@@ -267,6 +265,12 @@ pnpm lint
 pnpm typecheck
 pnpm build
 pnpm test:run
+```
+
+If you specifically touch real-tenant coverage, also run:
+
+```sh
+pnpm test:integration
 ```
 
 If there are still no tests in the repo, note that `pnpm test:run` will fail with “No test files found”. In that case:
@@ -444,4 +448,5 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 - Do not force raw channel strings everywhere when typed Cumulocity channel builders can be provided.
 - Do not assume DELETE events contain full resource payloads.
 - Do not use `pnpm test` in automation.
+- Do not add extra test layers when the current direction is to keep only the single real-tenant `C8YBayeuxConnection` integration test.
 - Do not forget to update `README.md` and `AGENTS.md` when public behavior or architecture changes.

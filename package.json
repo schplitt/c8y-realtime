@@ -44,7 +44,8 @@
     "prerelease": "eslint && tsc --noEmit && tsdown",
     "release": "bumpp",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "test:integration": "vitest run tests/integration"
   },
   "dependencies": {
     "hookable": "catalog:"
