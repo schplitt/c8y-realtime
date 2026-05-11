@@ -51,6 +51,7 @@
   },
   "devDependencies": {
     "@schplitt/eslint-config": "catalog:",
+    "@types/node": "catalog:",
     "bumpp": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
@@ -58,6 +59,6 @@
     "vitest": "catalog:"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   }
 }
