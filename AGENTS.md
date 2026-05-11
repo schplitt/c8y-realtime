@@ -2,280 +2,446 @@
 
 ## Project Overview
 
-**@schplitt/c8y-realtime** is a Web API compatible real-time client for Cumulocity IoT. It provides a simple, hook-based interface for subscribing to real-time updates from Cumulocity using the Bayeux protocol over WebSockets. The client is built on top of [hookable](https://github.com/unjs/hookable) and uses [better-result](https://github.com/dmmulroy/better-result) for robust error handling.
+**@schplitt/c8y-realtime** is a Cumulocity-specific realtime client that implements the required Bayeux message flow directly, without depending on `@c8y/client` realtime or CometD.
+
+The goal of this package is **not** to avoid the Cumulocity realtime protocol. The goal is to own the implementation stack and expose a cleaner, more controllable, strongly typed API for browser and server runtimes.
+
+**Project intent:**
+
+- Implement the Cumulocity realtime protocol directly
+- Be **WebSocket-first**
+- Work in both **browser** and **Node.js** environments
+- Keep the core **framework-agnnostic**
+- Expose plain TypeScript primitives, not framework hooks as the foundation
+- Provide **Cumulocity-specific helpers** instead of generic CometD abstractions
+- Stay intentionally narrow: this is **not** a general-purpose Bayeux client
+
+> **Current state:** The repository is still early and currently contains a minimal hook-based prototype. Treat that as an implementation starting point, **not** as the final architectural direction. Future work should move the package toward the framework-agnostic core described in this file.
+
+## Key Design Constraints
+
+### What this package is
+
+- A **minimal Bayeux-over-WebSocket client specialized for Cumulocity**
+- A library for **shared realtime infrastructure** in browser apps, servers, Nitro apps, and microservices
+- A package that owns its own:
+  - public API
+  - types
+  - auth abstraction
+  - reconnect behavior
+  - resubscription behavior
+  - Cumulocity channel helpers
+
+### What this package is not
+
+- Not a wrapper around CometD
+- Not a wrapper around `@c8y/client` realtime
+- Not a generic Bayeux client for arbitrary servers
+- Not a framework-specific hooks/composables package at the core layer
+
+### Core API direction
+
+Prefer building toward these primitives:
+
+- connection lifecycle control
+- subscription handles
+- typed events
+- typed channel builders
+- callback-based subscriptions and/or async iterables
+- explicit connection state events
+
+If framework hooks/composables are added later, they should be **thin wrappers on top of the core**, not the core itself.
 
 ## Architecture
 
-### Core Components
+### Current Repository Layout
 
-#### RealtimeClient
-
-- Main public API using `HookableCore` from hookable library internally
-- Manages lifecycle: lazy connection, hook registration, cleanup
-- Hook format: `hook(id, name, callback)`
-  - `id`: Device ID (string) or `'*'` for all devices
-  - `name`: Hook name like `'inventory:create'`, `'inventory:update'`, `'inventory:delete'`, `'inventory:all'`
-  - Internally uses key format: `${id}#${name}` for hook storage
-
-#### Connection Management
-
-- Handles **Web API WebSocket** connection to Cumulocity's `/notification/realtime` endpoint
-- Uses standard `WebSocket` API (works in Node.js 18+, Deno, Bun, and browsers)
-- Implements Bayeux protocol flow:
-  1. **Handshake**: POST to `/meta/handshake` → receive `clientId`
-  2. **Connect**: WebSocket connection for real-time messages
-  3. **Disconnect**: POST to `/meta/disconnect` on cleanup
-- Auto-reconnection logic with configurable delays
-- Uses `better-result` for internal connection error handling
-- Only connects when first hook is registered (lazy connection)
-
-#### Subscription Management
-
-- Manages Cumulocity channel subscriptions
-- Maps hook patterns to Cumulocity channels:
-  - `inventory:12345:*` → `/managedobjects/12345`
-  - `inventory:*:create` → `/managedobjects/*` (filtered by action)
-- Tracks active subscriptions and reference counts
-- Automatically subscribes/unsubscribes as hooks are added/removed
-- POST to `/meta/subscribe` or `/meta/unsubscribe`
-
-#### Message Routing
-
-- Receives messages from WebSocket connection
-- Parses Cumulocity notification format:
-  ```json
-  {
-    channel: "/managedobjects/145075",
-    data: [{
-      realtimeAction: "UPDATE",
-      data: { id: "145075", name: "...", ... }
-    }]
-  }
-  ```
-- Routes to appropriate hooks based on:
-  - Managed object ID from channel
-  - `realtimeAction` (CREATE, UPDATE, DELETE)
-- Handles wildcard subscriptions (`inventory:*:update`)
-
-### Data Flow
-
-1. User calls `client.hook('12345', 'inventory:update', callback)`
-2. RealtimeClient creates internal key: `'12345#inventory:update'`
-3. Stores callback in HookableCore with this key
-4. Returns unhook function that removes the callback
-5. When Cumulocity message arrives:
-   - Parser extracts `managedObjectId` and `realtimeAction`
-   - Creates matching key(s): `'${id}#inventory:${action}'` and `'${id}#inventory:all'`
-   - Also checks wildcard: `'*#inventory:${action}'` and `'*#inventory:all'`
-   - Triggers all matching hooks with parsed data
-6. User calls `unhook()` or `removeHook()` when done
-7. Callback is removed from internal storage
-
-### Bayeux Protocol Implementation
-
-The client implements the Bayeux protocol as specified by Cumulocity:
-
-#### Handshake Request
-
-```json
-[{
-  "channel": "/meta/handshake",
-  "version": "1.0"
-}]
+```text
+src/
+├── index.ts         # Main public entry point
+├── types.ts         # Current public hook and managed object types
+└── websocket.ts     # Reserved for websocket/runtime transport work
 ```
 
-#### Subscribe Request
+### Expected Near-Term Architecture
 
-```json
-[{
-  "channel": "/meta/subscribe",
-  "clientId": "<received-from-handshake>",
-  "subscription": "/managedobjects/<deviceId>"
-}]
+As the library grows, prefer a structure close to this:
+
+```text
+src/
+├── index.ts                 # Public exports only
+├── client/                  # High-level realtime client
+├── connection/              # Handshake/connect/disconnect/reconnect logic
+├── protocol/                # Bayeux message types and protocol helpers
+├── channels/                # Cumulocity-specific channel builders
+├── auth/                    # Auth strategy/types for browser and server use
+├── transport/               # WebSocket abstraction / injected implementation support
+├── routing/                 # Incoming message parsing and event routing
+├── subscriptions/           # Subscription registry, dedupe, ref counting
+├── types/                   # Public API and protocol types
+└── internal/                # Internal-only helpers and implementation details
+
+tests/
+├── unit/                    # Protocol, routing, channel, and state-machine tests
+└── integration/             # Mock-server or tenant-backed integration tests
 ```
 
-- **hookable**: Core pub/sub system for hook management
-  - Provides type-safe hook system
-  - Handles hook lifecycle (register, trigger, unregister)
-  - Returns unhook function for cleanup
-- **Hook naming**: Use format `<resource>:<id>:<action>`
-  - Resource: `inventory`, `alarm`, `event`action>`
-  - Resource: `inventory` (more resources to be added: `alarm`, `event`, `measurement`, `operation`)
-  - Action: `create`, `update`, `delete`, `all`
-  - Device ID is separate parameter: `hook(id, name, callback)`
-  - Reuse single WebSocket connection for all subscriptions
-  - Cumulocity limits parallel connections per user
+You do **not** need to create all of these immediately, but new code should move in this direction instead of deepening the current prototype shape.
 
-- **Don't forget to handle DELETE events differently**
-  - DELETE notifications only contain the managed object ID
-  - Other fields may be missing or undefined
+### Package Exports
 
-- **Don't ignore Bayeux protocol requirements**
-  - Must send `clientId` in all requests after handshake
-  - Must immediately repeat `/meta/connect` after receiving response
-  - Empty responses keep connection alive, must re-poll
+Current package export:
 
-- **Don't over-poll or stream large volumes**
-  - Long-polling is not designed for >100kB/sec or >50 events/sec
-  - This is a limitation of Cumulocity's implementation
+- `c8y-realtime` — main public entry point
 
-- **Don't forget session timeout (2 hours default)**
-  - Implement keep-alive by polling `/meta/connect`
-  - Handle re-authentication on session expiry
-- **Lazy initialization**: Don't create connections until needed
-  - First hook registration triggers connection
-  - Connection cleanup when last hook is removed
+Guidelines:
 
-- **Smart subscriptions**: Deduplicate Cumulocity subscriptions
-  - Multiple hooks for same device → single Cumulocity subscription
-  - Use reference counting to know when to unsubscribe
+- Keep all public exports in `src/index.ts`
+- Do not expose internal implementation files directly
+- Add new exports intentionally; avoid leaking unstable internals
 
-- **Error handling**: All fallible operations return `Result<T, E>`
-  - Connection errors
-  - Subscription failures
-  - Authentication errors
-  - Hook callback errors (optional, user-defined)
+## Realtime Protocol Scope
 
-- **Type safety**: Leverage TypeScript for hook types
-  - Define hook types with template literals: `inventory:${string}:${'create'|'update'|'delete'}`
-  - Ensure callback sInternal error handling for async operations
-  - Use `Result.ok(value)` and `Result.err(error)` internally for all connection operations
-  - Connection errors, subscription failures, and auth issues should return Results internally
-  - Makes error handling explicit and forces implementation to handle failures
-  - **Not exposed in public API** - users work with standard callbacks and try/catch
+This package should implement the Cumulocity realtime Bayeux flow directly.
 
-- **Web API WebSocket**: Universal runtime compatibility
-  - Use standard `WebSocket` API from Web APIs (no polyfills needed)
-  - Works natively in:
-    - **Node.js** 18+ (native WebSocket support)
-    - **Deno** (built-in WebSocket)
-    - **Bun** (built-in WebSocket)
-    - **Browsers** (native WebSocket)
-  - Use `fetch` for HTTP requests (handshake, subscribe, disconnect)
-  - No conditional imports or runtime detection needed.)
-  - Consider Node.js compatibility with conditional imports
+### Required Bayeux messages
 
-```json
-[{
-  "channel": "/meta/connect",
-  "clientId": "<clientId>",
-  "connectionType": "long-polling",
-  "advice": {
-    "timeout": 5400000,
-    "interval": 3000
-  }
-}]
-```
+- `/meta/handshake`
+- `/meta/connect`
+- `/meta/subscribe`
+- `/meta/unsubscribe`
+- `/meta/disconnect`
 
-### Authentication
+### Required behavior
 
-- Basic Auth: Base64 encoded credentials in Authorization header
-- OAuth: Access token in cookie, XSRF token in handshake `ext` object
-- WebSocket: Auth passed in handshake `ext.authentication` field
+- Perform handshake and store `clientId`
+- Include `clientId` in all subsequent meta requests
+- Maintain the connect loop as required by Bayeux/Cumulocity
+- Reconnect when the socket is lost
+- Re-handshake when required
+- Restore active subscriptions after reconnect
+- Surface connection state transitions clearly
 
-### Source (src/)
+### Important Cumulocity-specific notes
 
-- Main entry point for the package
-- All public exports should be defined in `index.ts`
-- Uses ESM module format
-- Internal modules for connection, subscription, and utilities
+- Realtime messages are Cumulocity-specific and should be modeled as such
+- Provide typed helpers for resources like:
+  - inventory
+  - alarms
+  - events
+  - measurements
+  - operations
+- Consumers should not need to manually build raw channel strings everywhere
+- DELETE payloads may only contain an identifier; do not assume full object payloads
 
-### Tests (tests/)
+### Message routing expectations
 
-- Uses Vitest for testing
-- Test files follow the `*.test.ts` naming convention
-- Import from `../src` to test the source code
-- Mock WebSocket connections for unit tests
-- Integration tests should use a test Cumulocity tenant (or mock server)
+Incoming messages should eventually be routed using Cumulocity semantics:
+
+- derive resource/channel information from the incoming message
+- determine the affected entity id when present
+- map Cumulocity realtime actions like `CREATE`, `UPDATE`, `DELETE`
+- route to exact and wildcard listeners where supported by the public API
+
+## Runtime Compatibility
+
+### Browser
+
+- Use native `WebSocket`
+- Use standard `fetch`
+- Avoid Node-only APIs in the core implementation
+
+### Node.js
+
+- Do **not** force a WebSocket dependency for all consumers
+- Support an **injected WebSocket implementation/polyfill** when needed
+- Keep the transport abstraction small and explicit
+- Avoid hidden runtime magic when a dependency must be provided
+
+### General runtime rules
+
+- Prefer Web APIs and portable TypeScript where possible
+- Keep the library compatible with server-side and browser-side usage
+- Avoid framework/runtime lock-in in core modules
+
+## Authentication
+
+The library should own a small auth abstraction instead of inheriting one from another client.
+
+Possible supported modes include:
+
+- Basic auth
+- Cookie/session-based auth for browser environments
+- Token-based auth if needed by Cumulocity flows
+- Handshake `ext` payload support where required
+
+Guidelines:
+
+- Keep auth types explicit
+- Keep auth transport concerns separate from channel/subscription concerns
+- Avoid baking app-specific auth assumptions into the core
+
+## Current Prototype Notes
+
+The current codebase exposes a hook-based `RealtimeClient` built on `hookable`.
+
+That is acceptable as a temporary scaffold, but future work should prefer:
+
+- framework-agnostic connection and subscription primitives
+- explicit subscription handles over implicit hook-only APIs
+- clear state management for disconnected / connecting / connected / reconnecting
+- typed channel/resource helpers instead of raw string usage
+
+If modifying the current prototype:
+
+- avoid making the hook-first API harder to replace later
+- keep new logic modular so it can be moved into connection/protocol/subscription layers
+- prefer extracting reusable internals over adding more logic directly into `src/index.ts`
 
 ## Development
 
 ```sh
 pnpm install    # Install dependencies
-pnpm test       # Run tests with Vitest (watch mode)
-pnpm test:run   # Run tests once (non-watch mode, for CI/automated workflows)
-pnpm build      # Build with tsdown
-pnpm lint       # Lint with ESLint
-pnpm lint:fix   # Lint and auto-fix
-pnpm typecheck  # TypeScript type checking
+pnpm build      # Build package with tsdown
+pnpm lint       # Run ESLint
+pnpm lint:fix   # Auto-fix lint issues
+pnpm typecheck  # TypeScript checks
+pnpm test       # Vitest watch mode
+pnpm test:run   # Vitest single run
+pnpm release    # Version/tag workflow helper via bumpp
 ```
 
-## Code Style
+## Build and Tooling
 
 - ESM only (`"type": "module"`)
 - TypeScript strict mode enabled
-- Uses `tsdown` for building
-- Uses `@schplitt/eslint-config` for linting
-- Uses `vitest` for testing
+- Built with `tsdown`
+- Linted with `@schplitt/eslint-config`
+- Tested with `vitest`
+- Package manager: `pnpm`
+- Node engine in `package.json`: `>=20.0.0`
+- CI currently runs on Node 22
+
+### Build output
+
+- Package output goes to `dist/`
+- Public package entry points resolve to built files in `dist/`
+- Declaration files are generated during build
 
 ## Testing
 
-- Write tests in the `tests/` directory
-- Use `*.test.ts` file naming convention
-- Run `pnpm test:run` for test run (use this in automated workflows, never use `pnpm test` as you will get stuck in watch mode)
-- Import modules from `../src`
+### Current status
 
-Example test structure:
+The repository currently has **no test files yet**. When adding functionality, add tests along with it.
 
-```ts
-import { expect, test } from 'vitest'
-import { myFunction } from '../src'
+### Test expectations
 
-test('should do something', () => {
-  expect(myFunction()).toBe(expectedValue)
-})
+- Put tests under `tests/`
+- Use `*.test.ts` naming
+- Import from `../src` or `../../src` depending on location
+- Prefer unit tests for:
+  - channel builders
+  - Bayeux message helpers
+  - reconnect state logic
+  - subscription deduplication
+  - message routing
+- Add integration-style tests for:
+  - handshake/connect flow
+  - reconnect and resubscribe behavior
+  - socket loss recovery
+  - auth and handshake edge cases
+
+### Automation rule
+
+- Use `pnpm test:run` in automation and agent workflows
+- Do **not** use `pnpm test` in automated runs because it starts watch mode
+
+## Commit, PR, and Release Workflow
+
+### Local workflow
+
+Before finishing a change, run:
+
+```sh
+pnpm lint
+pnpm typecheck
+pnpm build
+pnpm test:run
 ```
+
+If there are still no tests in the repo, note that `pnpm test:run` will fail with “No test files found”. In that case:
+
+- still run it when relevant
+- report the result clearly
+- do not pretend tests passed
+
+### Commit guidelines
+
+- Keep commits focused and scoped to one concern when possible
+- Include documentation updates in the same change when behavior or architecture changes
+- Avoid mixing large refactors with unrelated formatting or cleanup
+- Keep public API changes explicit in commit messages and final summaries
+
+### Pull request / CI workflow
+
+On pull requests, GitHub Actions currently runs:
+
+- `pnpm install --frozen-lockfile`
+- `pnpm build`
+- `pnpm lint`
+- `pnpm typecheck`
+
+Implications:
+
+- A change is not ready if it only typechecks locally but fails the build
+- Keep the lockfile in sync with dependency changes
+- Do not rely on unbuilt source-only behavior; build must pass too
+
+### Main branch autofix workflow
+
+On pushes to `main`, there is an autofix workflow that runs:
+
+- `pnpm lint:fix`
+
+Guidelines:
+
+- Do not rely on autofix to clean up sloppy work
+- Still run lint locally before finishing
+- Expect formatting/lint-only follow-up commits from automation if needed
+
+### Release workflow
+
+Releases are currently triggered by pushing a tag matching:
+
+```text
+v*
+```
+
+The release workflow currently performs:
+
+- install
+- test
+- build
+- lint
+- typecheck
+- changelog generation
+- npm publish
+
+Guidelines:
+
+- Do not change release-sensitive package metadata casually
+- Keep `package.json`, exports, and build output aligned
+- When versioning/publishing changes are made, verify tag-driven release assumptions still hold
+- If adjusting test commands in CI/release, keep watch mode out of automation paths
+
+## Code Style and Implementation Rules
+
+### Public API
+
+- Design for ergonomics, but keep internals explicit
+- Prefer named types and small interfaces over opaque stringly APIs
+- Make Cumulocity-specific helpers easy to discover
+- Keep the core API framework-agnostic
+
+### Error handling
+
+- Use standard exceptions and explicit error types where helpful
+- Surface connection and protocol failures clearly
+- Do not silently swallow reconnect/auth/subscription errors
+- Distinguish between recoverable transport failures and terminal configuration/auth failures
+
+### Type design
+
+- Prefer strong public typing over generic `any`-based event payloads
+- Model DELETE payloads separately where necessary
+- Use literal unions and helper types for resource/action/state values
+- Keep internal protocol types separate from user-facing ergonomic types when useful
+
+### File organization
+
+- Keep `src/index.ts` as the public export surface
+- Move reusable logic out of entry points into focused modules
+- Separate transport, protocol, routing, and subscription concerns
+- Avoid large god-files as the implementation grows
 
 ## Maintaining Documentation
 
 When making changes to the project:
 
-- **`AGENTS.md`** — Update with technical details, architecture, and best practices for AI agents
-  - Project architecture and file structure
-  - Internal patterns and conventions
-  - Development workflows
-  - Testing strategies
-  - Build/deployment processes
-  - Code organization principles
-  - Tool configurations and quirks
+- **`AGENTS.md`** — Update technical details, architecture, workflows, and agent guidance
+- **`README.md`** — Update all user-facing package documentation
 
-- **`README.md`** — Update with user-facing documentation for end users:
-  - ✅ New exported utilities or functions from the package
-  - ✅ New configuration options users can set
-  - ✅ New CLI commands or features
-  - ✅ Changes to existing API behavior
-  - ✅ Environment variables users can set
-  - ✅ Any feature users can configure, use, or interact with
-  - ✅ Installation or setup instructions
-  - ✅ Usage examples and code snippets
+### Update `README.md` when changing
+
+- public API shape
+- exported types or classes
+- installation/runtime requirements
+- auth options
+- channel builders
+- reconnect behavior
+- subscription behavior
+- browser/Node usage requirements
+- WebSocket injection requirements for Node users
+- examples and usage snippets
+
+### Update `AGENTS.md` when changing
+
+- file structure
+- architecture direction
+- protocol implementation strategy
+- development workflow
+- testing strategy
+- CI/release behavior
+- recurring project conventions or learnings
+
+### Documentation checklist
+
+- [ ] Did I add or change a public export?
+- [ ] Did I change runtime requirements or environment assumptions?
+- [ ] Did I change connection/reconnect/subscription behavior?
+- [ ] Did I add or move source files?
+- [ ] Did I change tests or verification workflow?
+- [ ] Did I update the relevant docs in the same change?
+- [ ] Did I explicitly tell the user that docs changed?
 
 ## Agent Guidelines
 
 When working on this project:
 
-1. **Run tests** after making changes: `pnpm test:run` (runs once, no watch mode)
-2. **Run linting** to ensure code quality: `pnpm lint`
-3. **Run type checking** before committing: `pnpm typecheck`
-4. **Update this file** when adding new modules, APIs, or changing architecture
-5. **Keep exports in `src/index.ts`** — all public API should be exported from the main entry point
-6. **Add tests** for new functionality in the `tests/` directory
-7. **Record learnings** — When the user corrects a mistake or provides context about how something should be done, add it to the "Project Context & Learnings" section below if it's a recurring pattern (not a one-time fix)
-8. **Notify documentation changes** — When updating `README.md` or `AGENTS.md`, explicitly call out the changes to the user at the end of your response so they can review and don't overlook them
+1. Read `AGENTS.md` before making architectural assumptions
+2. Keep all public exports in `src/index.ts`
+3. Favor the target architecture in this file over deepening the temporary hook-first prototype
+4. Add tests for new functionality under `tests/`
+5. Run `pnpm lint`, `pnpm typecheck`, and `pnpm build` after meaningful changes
+6. Run `pnpm test:run` for automated verification and report clearly if the repo still has no tests
+7. Update `AGENTS.md` when architecture, workflows, or conventions change
+8. Update `README.md` when user-facing behavior changes
+9. Record recurring learnings in the section below when the user corrects a pattern or direction
+10. Explicitly notify the user when documentation files were changed
 
 ## Project Context & Learnings
 
-This section captures project-specific knowledge, tool quirks, and lessons learned during development. When the user provides corrections or context about how things should be done in this project, add them here if they are recurring patterns (not a one-time fix).
-
-> **Note:** Before adding something here, consider: Is this a one-time fix, or will it come up again? Only document patterns that are likely to recur or are notable enough to prevent future mistakes.
+This section captures project-specific knowledge, tool quirks, and lessons learned during development. Only add items that are likely to matter again.
 
 ### Tools & Dependencies
 
-<!-- Add tool-specific notes, required configurations, or gotchas here -->
+- The package should stay lightweight and avoid unnecessary runtime dependencies in the core realtime implementation.
+- CI runs build, lint, and typecheck on pull requests; keep local verification aligned with that.
+- Release publishing is tag-driven through GitHub Actions and npm.
 
 ### Patterns & Conventions
 
-<!-- Add project-specific patterns, preferred approaches, or conventions here -->
+- Build toward a **framework-agnostic, WebSocket-first core**. Framework hooks/composables belong on top, not at the center of the library.
+- This library is **Cumulocity-specific on purpose**. Prefer explicit Cumulocity concepts and typed helpers over generic abstraction layers that add little value.
+- In Node environments, prefer **injected WebSocket implementations** over forcing a transport dependency on all users.
+- Use standard JavaScript/TypeScript error handling and explicit error types where useful.
+- Keep browser and server runtime concerns separated behind small abstractions.
 
 ### Common Mistakes to Avoid
 
-<!-- Add things that have been done wrong before and should be avoided -->
+- Do not turn this into a generic CometD/Bayeux client.
+- Do not hard-wire the core API to framework hooks/composables.
+- Do not force raw channel strings everywhere when typed Cumulocity channel builders can be provided.
+- Do not assume DELETE events contain full resource payloads.
+- Do not use `pnpm test` in automation.
+- Do not forget to update `README.md` and `AGENTS.md` when public behavior or architecture changes.

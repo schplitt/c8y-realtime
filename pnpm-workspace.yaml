@@ -10,7 +10,6 @@ trustPolicyExclude:
 
 catalog:
   '@schplitt/eslint-config': ^1.5.0
-  better-result: ^2.7.0
   bumpp: ^11.1.0
   eslint: ^10.3.0
   hookable: ^6.1.1

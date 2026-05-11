@@ -47,7 +47,6 @@
     "test:run": "vitest run"
   },
   "dependencies": {
-    "better-result": "catalog:",
     "hookable": "catalog:"
   },
   "devDependencies": {

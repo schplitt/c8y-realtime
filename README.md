@@ -7,6 +7,7 @@ A Web API compatible real-time client for Cumulocity IoT that provides a simple,
 - 🪝 **Hook-based API** - Simple event subscription using [hookable](https://github.com/unjs/hookable)
 - 🎯 **Type-safe** - Full TypeScript support with typed hooks
 - 🌐 **Web API Compatible** - Built for browsers, Node.js 18+, Deno, and Bun
+- 🧱 **Minimal library internals** - Uses standard JavaScript/TypeScript error handling without app-level result wrapper dependencies
 
 > **Status**: Early development.
 
@@ -79,8 +80,8 @@ unhook()
 # Install dependencies
 pnpm install
 
-# Run tests
-pnpm test
+# Run tests once
+pnpm test:run
 
 # Build
 pnpm build
