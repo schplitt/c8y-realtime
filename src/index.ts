@@ -1,56 +1,94 @@
-import { HookableCore } from 'hookable'
-import type { CumulocityHooks, HookCacheKey } from './types'
+/**
+ * c8y-realtime — a standalone, dependency-light TypeScript SDK for the
+ * Cumulocity IoT Notification 2.0 API.
+ *
+ * Zero dependency on `@c8y/client`. Native `fetch` for REST and `ws` (or the
+ * native `WebSocket`) for the consumer. ESM only, strict TypeScript.
+ *
+ * @example Single tenant
+ * ```ts
+ * import { createNotificationClient, SubscriptionApis } from 'c8y-realtime'
+ *
+ * const client = createNotificationClient({ baseUrl, tenant, user, password })
+ *
+ * await client.subscriptions.ensure({
+ *   context: 'tenant',
+ *   subscription: 'my-devices',
+ *   subscriptionFilter: { apis: [SubscriptionApis.measurements] },
+ * })
+ *
+ * const consumer = client.subscribe('my-devices', { subscriber: 'my-service' })
+ * for await (const notification of consumer) {
+ *   console.log(notification.action, notification.description.type, notification.payload)
+ *   break // auto-ack applies once processing finishes
+ * }
+ * await client.close()
+ * ```
+ */
 
+export { createMultiTenantClient, createNotificationClient, NotificationClient } from './client'
+export { WebSocketConsumer } from './consumer'
+export { C8yConnectionError, C8yError, C8yHttpError } from './errors'
+export { parseDescription, parseFrame, parsePayload } from './frame'
+export { basicAuthHeader, joinUrl, normalizeBaseUrl, toWebSocketUrl } from './http'
+export { createRealtimeClient, RealtimeClient } from './realtime'
+export { createToken, SubscriptionsApi, unsubscribeConsumer } from './subscriptions'
+export { SubscriptionApis } from './types'
+
+export type { ConsumerConfig } from './consumer'
 export type {
-  DeletionManageObject,
-  BasicManageObject,
-  CumulocityHooks,
-  CumulocityHookKey,
+  Alarm,
+  AlarmSeverity,
+  AlarmStatus,
+  C8yEvent,
+  DeletionPayload,
+  HookActionName,
+  HookPayload,
+  ManagedObject,
+  Measurement,
+  NotificationPayloadMap,
+  NotificationTypeName,
+  Operation,
+  OperationStatus,
+  SourceReference,
+} from './domain'
+export type { ParsedFrame } from './frame'
+export type {
+  AllRegister,
+  AnyRegister,
+  FragmentPayload,
+  HookKeyPayload,
+  IdRegister,
+  ManagedObjectHooks,
+  MeasurementHooks,
+  NotificationHandler,
+  RealtimeClientOptions,
+  RealtimeHookKey,
+  RealtimeSubscriptionOptions,
+  ScopedPayload,
+  ScopedRegister,
+  ScopeFilter,
+  TypeHooks,
+  Unsubscribe,
+} from './realtime'
+export type {
+  ConsumerResilienceOptions,
+  Logger,
+  Notification,
+  NotificationClientOptions,
+  NotificationDescription,
+  NotificationTokenOptions,
+  SubscribeOptions,
+  Subscription,
+  SubscriptionApi,
+  SubscriptionCollection,
+  SubscriptionContext,
+  SubscriptionFilter,
+  SubscriptionListFilter,
+  SubscriptionResponse,
+  SubscriptionSource,
+  TenantCredentials,
+  TokenResponse,
+  WebSocketFactory,
+  WebSocketInstanceLike,
 } from './types'
-
-export class RealtimeClient {
-  #hooks = new HookableCore()
-
-  hook<NameT extends keyof CumulocityHooks>(
-    id: '*' | (string & {}),
-    name: NameT,
-    fn: CumulocityHooks[NameT],
-  ): () => void {
-    const key = this.#createHookKey(id, name)
-    this.#hooks.hook(key, fn)
-    return () => {
-      this.#hooks.removeHook(key, fn)
-    }
-  }
-
-  removeHook<TName extends keyof CumulocityHooks>(id: '*' | (string & {}), name: TName, fn: CumulocityHooks[TName]): void {
-    const key = this.#createHookKey(id, name)
-    this.#hooks.removeHook(key, fn)
-  }
-
-  removeHooks(name: keyof CumulocityHooks): void {
-    const keysWithName = Object.entries(this.#hooks['_hooks'])
-      .filter(([key]) => key.endsWith(`#${name}`))
-
-    for (const [key, callback] of keysWithName) {
-      if (callback) {
-        for (const fn of callback) {
-          this.#hooks.removeHook(key, fn)
-        }
-      }
-    }
-  }
-
-  /**
-   * Creates a unique hook key based on the id and name.
-   * @param id - The id of the object or '*' to match all.
-   * @param name - The name of the hook.
-   * @returns The unique hook key in the format 'id#name', where name is <scope>:<action>. (id#<scope>:<action>)
-   */
-  #createHookKey<NameT extends keyof CumulocityHooks>(
-    id: '*' | (string & {}),
-    name: NameT,
-  ): HookCacheKey {
-    return `${id}#${name}`
-  }
-}

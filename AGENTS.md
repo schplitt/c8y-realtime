@@ -2,21 +2,34 @@
 
 ## Project Overview
 
-**@schplitt/c8y-realtime** is a Cumulocity-specific realtime client that implements the required Bayeux message flow directly, without depending on `@c8y/client` realtime or CometD.
+**c8y-realtime** is a standalone, dependency-light TypeScript SDK for the Cumulocity IoT **Notification 2.0** API. It implements the Notification 2.0 protocol directly (subscriptions REST, token minting, the `wss` consumer protocol, and the ack format) with **zero dependency on `@c8y/client`**.
 
-The goal of this package is **not** to avoid the Cumulocity realtime protocol. The goal is to own the implementation stack and expose a cleaner, more controllable, strongly typed API for browser and server runtimes.
+> **Source of truth:** `Notification2.md` (the 2.0 protocol) is the spec this is built against. `apis.md` is the _older_ Bayeux real-time API and is used ONLY as a reference for resource payload shapes and the CREATE/UPDATE/DELETE taxonomy — NOT the protocol. Ignore the Bayeux/CometD framing in older parts of this doc; this SDK is Notification 2.0.
 
 **Project intent:**
 
-- Implement the Cumulocity realtime protocol directly
-- Be **WebSocket-first**
-- Work in both **browser** and **Node.js** environments
-- Keep the core **framework-agnnostic**
-- Expose plain TypeScript primitives, not framework hooks as the foundation
-- Provide **Cumulocity-specific helpers** instead of generic CometD abstractions
-- Stay intentionally narrow: this is **not** a general-purpose Bayeux client
+- Implement Notification 2.0 directly (native `fetch` for REST, `ws` for the consumer)
+- Framework-agnostic core; the ergonomic high-level client is a thin layer on top
+- Work in Node.js (browser-friendly; the WebSocket impl is injectable)
+- Two layers: `createNotificationClient` (low-level core) and `createRealtimeClient` (typed hooks)
 
-> **Current state:** The repository is still early and currently contains a minimal hook-based prototype. Treat that as an implementation starting point, **not** as the final architectural direction. Future work should move the package toward the framework-agnostic core described in this file.
+### Architecture (actual)
+
+```text
+src/
+├── index.ts          # public exports
+├── types.ts          # protocol types (Subscription, TokenResponse, Notification, …)
+├── domain.ts         # domain payload types (Alarm, Measurement, ManagedObject, …)
+├── errors.ts         # C8yError / C8yHttpError / C8yConnectionError
+├── http.ts           # authenticated fetch (Basic auth, URL joining)
+├── subscriptions.ts  # notification2/subscriptions + /token + /unsubscribe
+├── frame.ts          # consumer wire-protocol frame parsing + ack id
+├── consumer.ts       # resilient WebSocketConsumer (async-iterable)
+├── client.ts         # createNotificationClient / createMultiTenantClient
+└── realtime.ts       # createRealtimeClient (typed hooks, one topic + one consumer)
+```
+
+Key model note (see Learnings): a Notification 2.0 **subscription** ≠ **topic** ≠ **consumer**. The high-level client uses ONE topic + ONE consumer, with per-scope subscriptions (apis narrowed to registered types) funneling in.
 
 ## Key Design Constraints
 
@@ -100,48 +113,29 @@ Guidelines:
 - Do not expose internal implementation files directly
 - Add new exports intentionally; avoid leaking unstable internals
 
-## Realtime Protocol Scope
+## Protocol Scope (Notification 2.0)
 
-This package should implement the Cumulocity realtime Bayeux flow directly.
+This package implements the Notification 2.0 flow directly — NOT the Bayeux/CometD real-time API.
 
-### Required Bayeux messages
+### REST (`notification2/*`)
 
-- `/meta/handshake`
-- `/meta/connect`
-- `/meta/subscribe`
-- `/meta/unsubscribe`
-- `/meta/disconnect`
+- `subscriptions` — create / list / get / delete forwarding rules. `ensure()` treats 409 as success.
+- `token` — mint a consumer JWT for a `(subscription, subscriber)`.
+- `unsubscribe?token=<jwt>` — remove a consumer (needs the topic live).
 
-### Required behavior
+### Consumer protocol (`wss://…/notification2/consumer/?token=<jwt>`)
 
-- Perform handshake and store `clientId`
-- Include `clientId` in all subsequent meta requests
-- Maintain the connect loop as required by Bayeux/Cumulocity
-- Reconnect when the socket is lost
-- Re-handshake when required
-- Restore active subscriptions after reconnect
-- Surface connection state transitions clearly
+- Frames are UTF-8 text: header lines separated by `\n`, a blank line, then the payload.
+- First header = the **ack id** (send it back verbatim on the same socket to acknowledge).
+- Second header = `/{tenantId}/{type}/{sourceId}`; third = action (`CREATE`/`UPDATE`/`DELETE`).
+- Resilience: ping/pong keepalive, reconnect with backoff, token refresh per connect, teardown flag, fatal-4xx stops instead of looping.
 
-### Important Cumulocity-specific notes
+### Subscription / topic / consumer model (critical)
 
-- Realtime messages are Cumulocity-specific and should be modeled as such
-- Provide typed helpers for resources like:
-  - inventory
-  - alarms
-  - events
-  - measurements
-  - operations
-- Consumers should not need to manually build raw channel strings everywhere
-- DELETE payloads may only contain an identifier; do not assume full object payloads
+A **subscription** ≠ a **topic** ≠ a **consumer** (see Learnings and `Notification2.md`). Deleting a subscription does not delete its topic or consumers. The high-level client uses ONE topic + ONE consumer, with per-scope subscriptions (`tenant` or `mo`+device, apis narrowed to registered types) funneling in; routing is client-side by `(type, sourceId, action)`.
 
-### Message routing expectations
-
-Incoming messages should eventually be routed using Cumulocity semantics:
-
-- derive resource/channel information from the incoming message
-- determine the affected entity id when present
-- map Cumulocity realtime actions like `CREATE`, `UPDATE`, `DELETE`
-- route to exact and wildcard listeners where supported by the public API
+- Names (subscription + subscriber) must be **alphanumeric**.
+- DELETE payloads may only contain an identifier; do not assume full object payloads.
 
 ## Runtime Compatibility
 
@@ -230,31 +224,33 @@ pnpm release    # Version/tag workflow helper via bumpp
 
 ## Testing
 
-### Current status
+There are two test tiers under `tests/`:
 
-The repository currently has **no test files yet**. When adding functionality, add tests along with it.
+- **`tests/unit/`** — pure/mocked unit tests (auth, URL joining, ensure-409, frame/ack parsing, consumer resilience via a `MockSocket`, realtime routing + apis narrowing + dedupe). Run in CI. `pnpm test:unit`.
+- **`tests/e2e/`** — **live** integration tests against a real Cumulocity tenant. **Local only** — NOT run in CI. `pnpm test:e2e`.
 
-### Test expectations
+### Live e2e requires a local `.env` (needed!)
 
-- Put tests under `tests/`
-- Use `*.test.ts` naming
-- Import from `../src` or `../../src` depending on location
-- Prefer unit tests for:
-  - channel builders
-  - Bayeux message helpers
-  - reconnect state logic
-  - subscription deduplication
-  - message routing
-- Add integration-style tests for:
-  - handshake/connect flow
-  - reconnect and resubscribe behavior
-  - socket loss recovery
-  - auth and handshake edge cases
+The e2e suite reads throwaway credentials from a **gitignored `.env`** at the repo root:
+
+```
+C8Y_REALTIME_URL=...
+C8Y_REALTIME_TENANT=...
+C8Y_REALTIME_USER=...
+C8Y_REALTIME_PASSWORD=...
+```
+
+When `.env` (or those env vars) are absent the whole e2e suite **auto-skips**, so `pnpm test:run` stays green without credentials. The e2e tests mutate a real tenant (create/delete managed objects, measurements, events, alarms, operations) and clean up in `afterAll` — including purging Messaging **consumers** via the admin API (see Learnings). Never commit `.env` or log its values.
+
+### CI vs local
+
+- **CI** (`.github/workflows/ci.yml`) runs `install → build → test:unit → lint → typecheck`. It does NOT run e2e (no secrets; e2e creates undeletable Messaging topics and mutates a real tenant).
+- Do **not** add the tenant credentials as CI secrets to run e2e in CI on the shared throwaway user — concurrent local+CI runs collide on the same fixed subscription/consumer names.
 
 ### Automation rule
 
-- Use `pnpm test:run` in automation and agent workflows
-- Do **not** use `pnpm test` in automated runs because it starts watch mode
+- Use `pnpm test:unit` (CI/automation) or `pnpm test:run` (all, e2e auto-skips without `.env`).
+- Do **not** use `pnpm test` in automated runs — it starts watch mode.
 
 ## Commit, PR, and Release Workflow
 
@@ -425,9 +421,17 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 
 ### Tools & Dependencies
 
-- The package should stay lightweight and avoid unnecessary runtime dependencies in the core realtime implementation.
-- CI runs build, lint, and typecheck on pull requests; keep local verification aligned with that.
+- The package should stay lightweight and avoid unnecessary runtime dependencies in the core realtime implementation. Runtime deps: `ws` (consumer) and `hookable` (high-level dispatch) only.
+- CI runs build, unit tests, lint, and typecheck on pull requests; keep local verification aligned with that.
 - Release publishing is tag-driven through GitHub Actions and npm.
+
+### Notification 2.0 resource model & cleanup (learned the hard way)
+
+- Three distinct server-side resources: **subscription** (`notification2/subscriptions`, has an `id`, deletable), **topic** (Messaging Service, named by the `subscription` field; many subscriptions with the same name funnel into ONE topic), and **consumer/subscriber** (created on first websocket connect; persists after disconnect).
+- Deleting a subscription does NOT delete the topic or its consumers. Disconnecting a websocket does NOT remove the consumer.
+- `subscriptionFilter.apis` is a **filter** (which data categories forward), alongside `typeFilter` (content) and `fragmentsToCopy` (payload trimming) — not a "channel". Scope is `context` + `source`, separately.
+- The old design created one topic+consumer per `(type, scope)` → a new topic every run (device ids change) → resource leak. Fixed: ONE topic + ONE consumer per client, per-scope subscriptions funneling in.
+- **Cleanup** (tests): delete subscription resources by id AND purge consumers via the admin API: `GET /service/messaging-management/tenants/{tenant}/namespaces/relnotif/topics` → `DELETE …/topics/{topic}/types/persistent/subscribers/{name}`. Topics themselves can NOT be deleted (405); they auto-GC once empty.
 
 ### Patterns & Conventions
 

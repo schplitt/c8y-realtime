@@ -30,6 +30,12 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Only unit tests run in CI. The live e2e suite (tests/e2e) requires real
+      # tenant credentials in a local .env and is intentionally NOT run in CI —
+      # it mutates a real tenant and creates undeletable Messaging topics.
+      - name: Unit tests
+        run: pnpm test:unit
+
       - name: Lint
         run: pnpm lint
 
