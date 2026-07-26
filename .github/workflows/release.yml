@@ -30,17 +30,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Test
-        run: pnpm test
-
       - name: Build
         run: pnpm build
-
-      - name: Lint
-        run: pnpm lint
-
-      - name: Typecheck
-        run: pnpm typecheck
 
       - name: Update npm
         run: npm install -g npm@latest
@@ -51,5 +42,3 @@ jobs:
 
       - name: Publish to NPM
         run: pnpm publish --access public --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

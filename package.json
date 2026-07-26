@@ -41,17 +41,21 @@
     "lint": "eslint",
     "lint:fix": "eslint --fix",
     "typecheck": "tsc --noEmit",
-    "prerelease": "eslint && tsc --noEmit && tsdown",
+    "prerelease": "eslint && tsc --noEmit && vitest run && tsdown",
     "release": "bumpp",
     "test": "vitest",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "test:unit": "vitest run tests/unit",
+    "test:e2e": "vitest run tests/e2e"
   },
   "dependencies": {
-    "hookable": "catalog:"
+    "hookable": "catalog:",
+    "ws": "catalog:"
   },
   "devDependencies": {
     "@schplitt/eslint-config": "catalog:",
     "@types/node": "catalog:",
+    "@types/ws": "catalog:",
     "bumpp": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
@@ -59,6 +63,6 @@
     "vitest": "catalog:"
   },
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=20.0.0"
   }
 }
