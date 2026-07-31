@@ -26,7 +26,7 @@
  * ```
  */
 
-export { createMultiTenantClient, createNotificationClient, NotificationClient } from './client'
+export { createNotificationClient, NotificationClient } from './client'
 export { WebSocketConsumer } from './consumer'
 export { C8yConnectionError, C8yError, C8yHttpError } from './errors'
 export { parseDescription, parseFrame, parsePayload } from './frame'
@@ -56,7 +56,6 @@ export type { ParsedFrame } from './frame'
 export type {
   AllRegister,
   AnyRegister,
-  FragmentPayload,
   HookKeyPayload,
   IdRegister,
   ManagedObjectHooks,
@@ -65,11 +64,10 @@ export type {
   RealtimeClientOptions,
   RealtimeHookKey,
   RealtimeSubscriptionOptions,
-  ScopedPayload,
-  ScopedRegister,
-  ScopeFilter,
   TypeHooks,
+  UnhookResult,
   Unsubscribe,
+  UnsubscribeResult,
 } from './realtime'
 export type {
   ConsumerResilienceOptions,
