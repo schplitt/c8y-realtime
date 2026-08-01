@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createRealtimeClient, REALTIME_NAME_REGEX, toRealtimeName } from '../../src/realtime'
+import { createRealtimeClient, isValidRealtimeName, REALTIME_NAME_REGEX, toRealtimeName } from '../../src/realtime'
 import { delay, MockSocket, waitFor } from './mock-socket'
 import type { Alarm, DeletionPayload } from '../../src/domain'
 import type { RealtimeClientOptions } from '../../src/realtime'
@@ -88,6 +88,36 @@ describe('toRealtimeName', () => {
     const base = { baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p' } as const
     const name = toRealtimeName('c8y/nitro-tenant.42')
     expect(() => createRealtimeClient({ ...base, name })).not.toThrow()
+  })
+})
+
+describe('isValidRealtimeName', () => {
+  it('accepts a valid lowercase name', () => {
+    expect(isValidRealtimeName('myapp1')).toBe(true)
+  })
+
+  it('accepts uppercase and mixed-case names (the spec allows A-Z)', () => {
+    expect(isValidRealtimeName('MYAPP')).toBe(true)
+    expect(isValidRealtimeName('MyApp1')).toBe(true)
+  })
+
+  it('accepts an alphanumeric mix', () => {
+    expect(isValidRealtimeName('c8yRealtime42')).toBe(true)
+  })
+
+  it('rejects an empty string', () => {
+    expect(isValidRealtimeName('')).toBe(false)
+  })
+
+  it('rejects names containing separators (hyphen, dot, underscore, tilde)', () => {
+    expect(isValidRealtimeName('has-hyphen')).toBe(false)
+    expect(isValidRealtimeName('has.dot')).toBe(false)
+    expect(isValidRealtimeName('has_underscore')).toBe(false)
+    expect(isValidRealtimeName('has~tilde')).toBe(false)
+  })
+
+  it('rejects a whitespace string', () => {
+    expect(isValidRealtimeName('   ')).toBe(false)
   })
 })
 

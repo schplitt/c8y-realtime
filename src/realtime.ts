@@ -317,12 +317,36 @@ const DEDUPE_WINDOW = 2048
 
 /**
  * The Cumulocity alphanumeric subscription/subscriber-name rule: a `name` must
- * consist solely of ASCII letters and digits (`[a-z0-9]`, case-insensitive) and
- * be non-empty. This is the single source of truth used by the
- * {@link RealtimeClient} constructor; export it so downstream consumers can
- * validate/derive a `name` without hardcoding a divergent copy of the rule.
+ * consist solely of ASCII letters and digits and be non-empty. Mirrors the C8Y
+ * core OpenAPI `NotificationSubscription.subscription` pattern (`^[a-zA-Z0-9]+$`,
+ * `minLength: 1`) exactly, so both cases are accepted. This is the single source
+ * of truth used by the {@link RealtimeClient} constructor; export it so
+ * downstream consumers can validate/derive a `name` without hardcoding a
+ * divergent copy of the rule.
  */
-export const REALTIME_NAME_REGEX = /^[a-z0-9]+$/i
+export const REALTIME_NAME_REGEX = /^[a-zA-Z0-9]+$/
+
+/**
+ * The minimum length of a realtime/subscription `name`, mirroring the C8Y core
+ * OpenAPI `NotificationSubscription.subscription` `minLength: 1`.
+ */
+export const REALTIME_NAME_MIN_LENGTH = 1
+
+/**
+ * True iff `name` is a legal Cumulocity realtime/subscription name: alphanumeric
+ * (per {@link REALTIME_NAME_REGEX}) **and** non-empty (per
+ * {@link REALTIME_NAME_MIN_LENGTH}), matching the C8Y core OpenAPI
+ * `NotificationSubscription.subscription` schema.
+ *
+ * @param name
+ * @returns whether `name` is a valid realtime/subscription name
+ */
+export function isValidRealtimeName(name: string): boolean {
+  // The length check is technically implied by the regex `+` quantifier, but is
+  // kept explicit so the spec's `minLength` is encoded independently of the
+  // pattern.
+  return name.length >= REALTIME_NAME_MIN_LENGTH && REALTIME_NAME_REGEX.test(name)
+}
 
 /**
  * Turn an arbitrary string into a candidate realtime `name` by stripping every
@@ -437,7 +461,7 @@ export class RealtimeClient {
   constructor(options: RealtimeClientOptions) {
     this.#client = createNotificationClient(options)
     this.#logger = options.logger ?? { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
-    if (!options.name || !REALTIME_NAME_REGEX.test(options.name)) {
+    if (!options.name || !isValidRealtimeName(options.name)) {
       throw new TypeError(
         `realtime: a unique alphanumeric \`name\` is required (got ${JSON.stringify(options.name)}). `
         + 'Give each application its own name so independently-deployed apps do not become competing consumers on the same topic.',
