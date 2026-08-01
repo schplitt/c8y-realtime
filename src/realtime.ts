@@ -316,6 +316,31 @@ const WILDCARD = '*'
 const DEDUPE_WINDOW = 2048
 
 /**
+ * The Cumulocity alphanumeric subscription/subscriber-name rule: a `name` must
+ * consist solely of ASCII letters and digits (`[a-z0-9]`, case-insensitive) and
+ * be non-empty. This is the single source of truth used by the
+ * {@link RealtimeClient} constructor; export it so downstream consumers can
+ * validate/derive a `name` without hardcoding a divergent copy of the rule.
+ */
+export const REALTIME_NAME_REGEX = /^[a-z0-9]+$/i
+
+/**
+ * Turn an arbitrary string into a candidate realtime `name` by stripping every
+ * character that is not `[a-z0-9]` (case-insensitive).
+ *
+ * Any **non-empty** result is guaranteed to satisfy {@link REALTIME_NAME_REGEX}.
+ * This does **not** throw, does **not** add uniqueness, and **can return an
+ * empty string** (e.g. an input made up entirely of separators like `'---'`).
+ * The caller is responsible for handling/validating an empty result.
+ *
+ * @param raw
+ * @returns the sanitized name, possibly empty
+ */
+export function toRealtimeName(raw: string): string {
+  return raw.replace(/[^a-z0-9]/gi, '')
+}
+
+/**
  * One registered handler's bookkeeping. `subKey` (`${type}#${scope}`) identifies
  * the shared single-type subscription; `hookKey` (`${scope}#${type}:${action}`)
  * identifies the hookable bucket it fires from.
@@ -412,7 +437,7 @@ export class RealtimeClient {
   constructor(options: RealtimeClientOptions) {
     this.#client = createNotificationClient(options)
     this.#logger = options.logger ?? { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} }
-    if (!options.name || !/^[a-z0-9]+$/i.test(options.name)) {
+    if (!options.name || !REALTIME_NAME_REGEX.test(options.name)) {
       throw new TypeError(
         `realtime: a unique alphanumeric \`name\` is required (got ${JSON.stringify(options.name)}). `
         + 'Give each application its own name so independently-deployed apps do not become competing consumers on the same topic.',

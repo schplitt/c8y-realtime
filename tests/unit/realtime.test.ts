@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { createRealtimeClient } from '../../src/realtime'
+import { createRealtimeClient, REALTIME_NAME_REGEX, toRealtimeName } from '../../src/realtime'
 import { delay, MockSocket, waitFor } from './mock-socket'
 import type { Alarm, DeletionPayload } from '../../src/domain'
 import type { RealtimeClientOptions } from '../../src/realtime'
@@ -63,6 +63,31 @@ describe('realtimeClient — construction', () => {
     expect(() => createRealtimeClient({ ...base, name: '' })).toThrow(/name/)
     expect(() => createRealtimeClient({ ...base, name: 'has-hyphen' })).toThrow(/alphanumeric/)
     expect(() => createRealtimeClient({ ...base, name: 'myApp1' })).not.toThrow()
+  })
+})
+
+describe('toRealtimeName', () => {
+  it('leaves an already-valid alphanumeric name unchanged', () => {
+    expect(toRealtimeName('myApp1')).toBe('myApp1')
+  })
+
+  it('strips separators (hyphens, dots, underscores, tildes)', () => {
+    const sanitized = toRealtimeName('my-app.name_v2~beta')
+    expect(sanitized).toBe('myappnamev2beta')
+    expect(REALTIME_NAME_REGEX.test(sanitized)).toBe(true)
+  })
+
+  it('returns an empty string for all-separator input', () => {
+    const sanitized = toRealtimeName('---...___')
+    expect(sanitized).toBe('')
+    // an empty result does not satisfy the rule — the caller must handle it
+    expect(REALTIME_NAME_REGEX.test(sanitized)).toBe(false)
+  })
+
+  it('produces a name the constructor accepts', () => {
+    const base = { baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p' } as const
+    const name = toRealtimeName('c8y/nitro-tenant.42')
+    expect(() => createRealtimeClient({ ...base, name })).not.toThrow()
   })
 })
 
