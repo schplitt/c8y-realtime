@@ -3,9 +3,9 @@
 A small, typed TypeScript SDK for **Cumulocity Notification 2.0** realtime streams.
 
 - Typed handlers per type, action, and device — `rt.alarms.onCreate('12345', (a) => …)`.
-- No dependency on `@c8y/client`. Native `fetch`, and `ws` for the WebSocket.
+- No runtime dependencies to speak of — native `fetch` and the runtime's global `WebSocket`. No `@c8y/client`, no `ws`.
 - Handles the token, connection, keep-alive, reconnect, and de-duplication for you.
-- ESM only, strict TypeScript, Node ≥ 20.
+- ESM only, strict TypeScript, Node ≥ 22 (or any runtime with a global `WebSocket`).
 
 Two ways to use it:
 
@@ -15,10 +15,10 @@ Two ways to use it:
 ## Install
 
 ```sh
-pnpm add c8y-realtime ws
+pnpm add c8y-realtime
 ```
 
-`ws` is used for the WebSocket in Node. In the browser (or any runtime with a global `WebSocket`) it's picked up automatically; you can also pass your own via `webSocketImpl`.
+Uses the runtime's global `WebSocket` — Node 22+, browsers, and other modern runtimes have one built in. On an older runtime, or to use a specific implementation, pass your own via `webSocketImpl` (e.g. `import { WebSocket } from 'ws'`).
 
 ## Quick start
 
@@ -54,7 +54,7 @@ Each register returns a function that removes that handler. Payloads are fully t
 
 The device is always the first argument: `'*'` for all devices, or a device id. Some types only allow one or the other, and the types enforce it:
 
-| Type / action                          | `'*'` (all) | a device id  |
+| Type / Action                          | `'*'` (All) | A Device Id  |
 | -------------------------------------- | ----------- | ------------ |
 | `managedObjects.onCreate`              | ✓ (only)    | ✗            |
 | `managedObjects.onUpdate` / `onDelete` | ✗           | ✓ (required) |
@@ -69,15 +69,15 @@ The device is always the first argument: `'*'` for all devices, or a device id. 
 
 Required: `name` (unique per app, alphanumeric), plus `baseUrl`, `tenant`, `user`, `password`.
 
-| Option                      | Default | What it does                                                         |
-| --------------------------- | ------- | -------------------------------------------------------------------- |
-| `deleteSubscriptionOnEmpty` | `true`  | Delete a device's remote subscription when its last handler is gone. |
-| `deleteSubscriptionsOnClose`| `false` | Delete every subscription this client created on `close()`.          |
-| `autoAck`                   | `true`  | Acknowledge each message after its handlers finish.                  |
-| `autoStart`                 | `true`  | Connect as soon as handlers are registered.                          |
-| `ensureSubscription`        | `true`  | Create the subscription on the platform if missing.                  |
-| `dedupe`                    | `true`  | Drop identical messages redelivered on the same stream.              |
-| `subscription`              | —       | `{ apis?, nonPersistent? }` (see [persistence](#persistence)).       |
+| Option                       | Default | What It Does                                                         |
+| ---------------------------- | ------- | -------------------------------------------------------------------- |
+| `deleteSubscriptionOnEmpty`  | `true`  | Delete a device's remote subscription when its last handler is gone. |
+| `deleteSubscriptionsOnClose` | `false` | Delete every subscription this client created on `close()`.          |
+| `autoAck`                    | `true`  | Acknowledge each message after its handlers finish.                  |
+| `autoStart`                  | `true`  | Connect as soon as handlers are registered.                          |
+| `ensureSubscription`         | `true`  | Create the subscription on the platform if missing.                  |
+| `dedupe`                     | `true`  | Drop identical messages redelivered on the same stream.              |
+| `subscription`               | —       | `{ apis?, nonPersistent? }` (see [persistence](#persistence)).       |
 
 Also accepts `resilience`, `logger`, `webSocketImpl`, `fetchImpl`.
 
@@ -86,20 +86,21 @@ Also accepts `resilience`, `logger`, `webSocketImpl`, `fetchImpl`.
 Each returns an `Unsubscribe` function. Every register also takes an optional `label` (unique per client) so you can remove it later without keeping the returned function.
 
 ```ts
-rt.alarms.onCreate(scope, handler, label?)      // scope: '*' or a device id
-rt.measurements.onUpdate(deviceId, handler)     // device id required
-rt.managedObjects.onCreate('*', handler)        // all devices only
-rt.hook('alarms:create:12345', handler, label?) // key = '<type>:<action>:<scope>'
-rt.onAny(handler, label?)                        // or rt.onAny(deviceId, handler)
+// `label` is optional in every register (see above).
+rt.alarms.onCreate(scope, handler, label) // scope: '*' or a device id
+rt.measurements.onUpdate(deviceId, handler) // device id required
+rt.managedObjects.onCreate('*', handler) // all devices only
+rt.hook('alarms:create:12345', handler, label) // key = '<type>:<action>:<scope>'
+rt.onAny(handler, label) // or rt.onAny(deviceId, handler)
 ```
 
 ### Removing handlers
 
 ```ts
 const off = rt.alarms.onCreate('12345', handler)
-off()                              // remove this one handler
+off() // remove this one handler
 
-rt.unhook('myLabel')               // remove the one handler with that label
+rt.unhook('myLabel') // remove the one handler with that label
 // → { removed, subscriptionDeleted }
 
 rt.unsubscribe('alarms:create:12345')
@@ -110,8 +111,8 @@ rt.detach('alarms:create:12345')
 // remove ALL handlers but KEEP the remote subscription (see below)
 // → { removed, count, subscriptionDeleted: false }
 
-rt.hasHook('alarms:create:12345')  // → boolean
-rt.hookKeys()                      // → ['alarms:create:12345', …]
+rt.hasHook('alarms:create:12345') // → boolean
+rt.hookKeys() // → ['alarms:create:12345', …]
 ```
 
 `subscriptionDeleted` is `true` only when that removal left the device with no handlers _and_ the remote subscription was actually deleted. A key's handlers share one subscription with the other actions on the same device, so it isn't deleted while any of them remain.

@@ -585,6 +585,56 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
     await rt.close()
   })
 
+  it('a re-subscribe waits for an in-flight delete before recreating (no lost subscription)', async () => {
+    MockSocket.reset()
+    const events: string[] = []
+    let releaseDelete: (() => void) | undefined
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string }) => {
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? JSON.parse(init.body) as { subscription?: string } : {}
+      if (url.includes('notification2/token'))
+        return json({ token: `tok-${body.subscription}` })
+      if (url.includes('notification2/subscriptions') && method === 'POST') {
+        events.push('create')
+        return json({ id: `sub-${body.subscription}`, ...body }, 201)
+      }
+      if (url.includes('notification2/subscriptions/') && method === 'DELETE') {
+        events.push('delete-start')
+        await new Promise<void>((resolve) => {
+          releaseDelete = resolve
+        }) // gate the delete open
+        events.push('delete-end')
+        return new Response(null, { status: 204 })
+      }
+      return json({ subscriptions: [] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({
+      name: 'c8yRealtime',
+      baseUrl: 'https://a.com',
+      tenant: 't',
+      user: 'u',
+      password: 'p',
+      webSocketImpl: MockSocket as unknown as WebSocketFactory,
+      fetchImpl,
+      autoStart: false,
+    })
+
+    const off = rt.alarms.onCreate('111', () => {}) // first create
+    await rt.start()
+    off() // last handler gone → starts the (gated) delete
+    await waitFor(() => events.includes('delete-start'))
+
+    rt.alarms.onCreate('111', () => {}) // re-subscribe while the delete is still in flight
+    await delay(10)
+    expect(events).toEqual(['create', 'delete-start']) // recreate is holding, not racing
+
+    releaseDelete!() // let the delete finish
+    await waitFor(() => events.filter((e) => e === 'create').length >= 2)
+    // the recreate ran only after the delete completed — never interleaved
+    expect(events).toEqual(['create', 'delete-start', 'delete-end', 'create'])
+    await rt.close()
+  })
+
   it('removes a single handler by unique label; reports found + subscriptionDeleted', () => {
     MockSocket.reset()
     const { rt } = lifecycleClient()

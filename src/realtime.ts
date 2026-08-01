@@ -790,9 +790,18 @@ export class RealtimeClient {
     this.#subs.delete(subKey)
     if (!idPromise)
       return
-    Promise.resolve(idPromise)
+    // Record the in-flight delete so a re-subscribe of the same `(type, scope)`
+    // waits for it to finish before creating (see #ensureSub) — otherwise the
+    // create could land first and this delete would then remove it, leaving the
+    // client silently unsubscribed.
+    const done: Promise<void> = Promise.resolve(idPromise)
       .then((id) => (id ? this.#client.subscriptions.delete(id).catch(() => {}) : undefined))
       .catch(() => {})
+      .finally(() => {
+        if (this.#pendingDeletes.get(subKey) === done)
+          this.#pendingDeletes.delete(subKey)
+      })
+    this.#pendingDeletes.set(subKey, done)
   }
 
   /**
@@ -835,7 +844,11 @@ export class RealtimeClient {
         apis: type === WILDCARD ? [...this.#apis] : [type as SubscriptionApi],
       },
     }
-    const promise = this.#client.subscriptions.ensure(subscription)
+    // If a delete for this `(type, scope)` is still in flight, wait for it to
+    // finish before creating, so the create can't be undone by the late delete.
+    const pending = this.#pendingDeletes.get(key)
+    const promise = (pending ?? Promise.resolve())
+      .then(() => this.#client.subscriptions.ensure(subscription))
       .then((created) => {
         if (created.id)
           this.#ownedSubscriptionIds.push(created.id)

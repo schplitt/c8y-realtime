@@ -47,7 +47,7 @@ export interface ConsumerConfig {
    */
   mintToken: () => Promise<string>
   /**
-   * Resolves the WebSocket implementation (lazily; e.g. dynamic `import('ws')`).
+   * Resolves the WebSocket implementation (the global `WebSocket`, or an override).
    */
   getWebSocket: () => Promise<WebSocketFactory>
   autoAck: boolean
