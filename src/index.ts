@@ -32,7 +32,7 @@ export { WebSocketConsumer } from './consumer'
 export { C8yConnectionError, C8yError, C8yHttpError } from './errors'
 export { parseDescription, parseFrame, parsePayload } from './frame'
 export { basicAuthHeader, joinUrl, normalizeBaseUrl, toWebSocketUrl } from './http'
-export { createRealtimeClient, RealtimeClient } from './realtime'
+export { createRealtimeClient, REALTIME_NAME_REGEX, RealtimeClient, toRealtimeName } from './realtime'
 export { createToken, SubscriptionsApi, unsubscribeConsumer } from './subscriptions'
 export { SubscriptionApis } from './types'
 
