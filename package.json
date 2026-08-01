@@ -49,13 +49,11 @@
     "test:e2e": "vitest run tests/e2e"
   },
   "dependencies": {
-    "hookable": "catalog:",
-    "ws": "catalog:"
+    "hookable": "catalog:"
   },
   "devDependencies": {
     "@schplitt/eslint-config": "catalog:",
     "@types/node": "catalog:",
-    "@types/ws": "catalog:",
     "bumpp": "catalog:",
     "eslint": "catalog:",
     "tsdown": "catalog:",
@@ -63,6 +61,6 @@
     "vitest": "catalog:"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   }
 }

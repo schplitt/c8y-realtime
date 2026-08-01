@@ -3,33 +3,50 @@
  * Notification 2.0 — built on top of the framework-agnostic core
  * ({@link createNotificationClient}) and powered by `hookable`.
  *
- * Two registration surfaces, both fully typed:
+ * Two registration surfaces, both fully typed and both taking an **explicit
+ * scope + a handler** (+ an optional unique label) — no options object. The
+ * scope is always required: pass `'*'` for all devices or a source id for one.
  *
- * - Fluent namespaces:   `rt.alarms.onCreate({ id: '12345' }, (alarm) => …)`
- * - Hookable-style keys: `rt.hook({ key: 'alarms:create' }, (alarm) => …)`
- *
- * Every register takes an **options object** as its first argument (never a bare
- * string), so `{ … }` gets clean property completion for `id`/`key`,
- * `typeFilter`, and `fragmentsToCopy`.
+ * - Fluent namespaces:   `rt.alarms.onCreate('*', (alarm) => …)` / `rt.alarms.onCreate('12345', (alarm) => …)`
+ * - Hookable-style keys: `rt.hook('alarms:create:*', (alarm) => …)`
  *
  * ## Scoping
  *
  * Each handler is scoped to a source (device) id or to all devices (`*`). The
- * scope drives a **real subscription**: registering `rt.alarms.onCreate({}, fn)`
- * opens a `tenant` subscription (all devices); `rt.alarms.onCreate({ id: '12345' }, fn)`
+ * scope drives a **real subscription**: registering `rt.alarms.onCreate('*', fn)`
+ * opens a `tenant` subscription (all devices); `rt.alarms.onCreate('12345', fn)`
  * opens an `mo` subscription for that device. Each `(type, scope)` is its own
  * single-type subscription (never merged, never re-created); all subscriptions
  * of a type funnel into that type's topic, read by one consumer.
  *
- * The id is optional and defaults to `*` — **except** where Cumulocity has no
- * tenant-wide feed, which the types enforce:
+ * The scope segment is always present — **except** where Cumulocity constrains
+ * it, which the types enforce:
  *
- * | type / action                | all-devices | specific id |
- * | ---------------------------- | ----------- | ----------- |
- * | managedobjects:create        | ✓           | ✗           |
- * | managedobjects:update/delete | ✗           | ✓ (required)|
- * | measurements:*               | ✗           | ✓ (required)|
- * | alarms/events/operations:*   | ✓           | ✓           |
+ * | type / action                | all-devices (`'*'`) | specific id |
+ * | ---------------------------- | ------------------- | ----------- |
+ * | managedobjects:create        | ✓ (must be `'*'`)   | ✗           |
+ * | managedobjects:update/delete | ✗                   | ✓ (required)|
+ * | measurements:*               | ✗                   | ✓ (required)|
+ * | alarms/events/operations:*   | ✓                   | ✓           |
+ *
+ * ## Lifecycle
+ *
+ * A `(type, scope)` subscription lives as long as it has at least one registered
+ * handler (across all of its actions). With `deleteSubscriptionOnEmpty` (default
+ * `true`), removing the **last** handler for a `(type, scope)` deletes its remote
+ * subscription and — once a whole type has no scopes left — closes that type's
+ * consumer. Use {@link RealtimeClient.detach} to remove handlers while keeping
+ * the remote subscription alive for a later resume.
+ *
+ * ## No server-side or client-side filtering
+ *
+ * Subscriptions always forward the **full** message for their type — there is no
+ * `typeFilter` and no `fragmentsToCopy`. Cumulocity Notification 2.0 has no
+ * atomic *update* on a subscription (only delete + create), so a per-scope filter
+ * could only be changed by unsubscribe→resubscribe (risking lost messages) or
+ * subscribe→unsubscribe (risking double delivery). Forwarding everything keeps the
+ * subscription immutable and lets any number of handlers share one `(type, scope)`
+ * stream without conflict. Filter/shape inside your handler if you need to.
  */
 import { createHooks } from 'hookable'
 import { createNotificationClient } from './client'
@@ -66,73 +83,41 @@ export type NotificationHandler<P> = (payload: P, notification: Notification<P>)
 export type Unsubscribe = () => void
 
 /**
- * Per-subscription filter/shaping options for a scope. These map to the
- * underlying subscription's `subscriptionFilter.typeFilter` and `fragmentsToCopy`
- * and are applied when the scope's subscription is first created.
+ * The outcome of {@link RealtimeClient.unsubscribe} / {@link RealtimeClient.detach}:
+ * whether anything was removed and how many handlers (multiple handlers can
+ * share one key).
  */
-export interface ScopeFilter {
+export interface UnsubscribeResult {
   /**
-   * Match against the message `type` — pass the raw type name(s); they are
-   * quoted and combined with OData `or` for you. A single name or an array:
-   * `'c8y_Temperature'` → `"'c8y_Temperature'"`, and
-   * `['c8y_Temperature', 'c8y_Pressure']` → `"'c8y_Temperature' or 'c8y_Pressure'"`.
-   * When passed as a literal, the payload's `type` is narrowed to that union.
+   * `true` when at least one handler was removed (i.e. the key had handlers).
    */
-  typeFilter?: string | readonly string[]
+  removed: boolean
   /**
-   * Restrict forwarded messages to these custom fragments. Base/known fields
-   * (`id`, `source`, `type`, `time`, `self`, and type-specific ones like an
-   * alarm's `severity`/`status`) are always kept; only non-listed *custom*
-   * fragments are dropped. When passed as an array literal, the handler payload
-   * is narrowed to the known fields + exactly these fragment keys (the
-   * `[string]: unknown` catch-all is removed, so unlisted fragments are a
-   * compile error).
+   * How many handlers were removed. `0` means the key had none registered.
    */
-  fragmentsToCopy?: readonly string[]
+  count: number
+  /**
+   * `true` if removing these handlers emptied the `(type, scope)` and its remote
+   * subscription was torn down (and the type's consumer closed if it was that
+   * type's last scope). Always `false` for {@link RealtimeClient.detach}.
+   */
+  subscriptionDeleted: boolean
 }
 
 /**
- * Drops the `[string]: unknown` index signature, keeping only explicit keys.
+ * The outcome of {@link RealtimeClient.unhook} (single handler by label).
  */
-type KnownKeys<T> = {
-  [K in keyof T as string extends K ? never : number extends K ? never : symbol extends K ? never : K]: T[K]
-}
-
-/**
- * The union of type names from a `typeFilter` literal (string or array).
- */
-type TypeUnion<T> = T extends readonly string[] ? T[number] : T
-
-/**
- * Payload type when a scope uses `fragmentsToCopy`: the domain type's known
- * fields plus exactly the listed fragment names (each `unknown`), without the
- * catch-all index signature.
- */
-export type FragmentPayload<P, F extends readonly string[]> = KnownKeys<P> & {
-  [K in F[number]]: unknown
-}
-
-/**
- * Apply `fragmentsToCopy` narrowing (only when `F` is provided).
- */
-type WithFragments<P, F extends readonly string[]> = [F] extends [never] ? P : FragmentPayload<P, F>
-
-/**
- * The payload type a scoped registration receives, given the domain type `P`,
- * the `typeFilter` literal `T`, and the `fragmentsToCopy` literal `F`. Applies
- * fragment narrowing, then narrows `type` to the `typeFilter` union.
- */
-export type ScopedPayload<P, T extends string | readonly string[], F extends readonly string[]>
-  = string extends T
-    ? WithFragments<P, F>
-    : Omit<WithFragments<P, F>, 'type'> & { type: TypeUnion<T> }
-
-/**
- * The typed options object for a scoped registration (drives {@link ScopedPayload}).
- */
-interface ScopeOptions<T extends string | readonly string[], F extends readonly string[]> {
-  typeFilter?: T
-  fragmentsToCopy?: F
+export interface UnhookResult {
+  /**
+   * `true` if a handler with that label existed and was removed; `false` if no
+   * such label was registered on this client.
+   */
+  removed: boolean
+  /**
+   * `true` if that was the last handler for its `(type, scope)` and the remote
+   * subscription was torn down (subject to `deleteSubscriptionOnEmpty`).
+   */
+  subscriptionDeleted: boolean
 }
 
 /**
@@ -142,43 +127,32 @@ interface ScopeOptions<T extends string | readonly string[], F extends readonly 
 type SourceScope = '*' | (string & {})
 
 /**
- * Register an all-devices handler. Always an options object (a single object
- * signature — no string/union — so `{ … }` gets clean property completion).
- * Use `{}` for all devices.
+ * Register an all-devices handler. The scope is **required** and must be the
+ * literal `'*'` — this action only exists tenant-wide (e.g. managed-object
+ * `create`), so there is no device-id form. An optional unique `label` lets you
+ * remove this exact handler later via {@link RealtimeClient.unhook}.
  */
 export interface AllRegister<P> {
-  <const T extends string | readonly string[] = string, const F extends readonly string[] = never>(
-    options: ScopeOptions<T, F>,
-    handler: NotificationHandler<ScopedPayload<P, T, F>>,
-  ): Unsubscribe
+  (scope: '*', handler: NotificationHandler<P>, label?: string): Unsubscribe
 }
 
 /**
- * Register a device-scoped handler (source id required — no tenant-wide feed).
- * Always an options object with `id`.
+ * Register a device-scoped handler — the source id is **required** (this type has
+ * no tenant-wide feed, e.g. `measurements` or managed-object `update`/`delete`).
+ * An optional unique `label` enables {@link RealtimeClient.unhook}.
  */
 export interface IdRegister<P> {
-  <const T extends string | readonly string[] = string, const F extends readonly string[] = never>(
-    options: ScopeOptions<T, F> & { id: string },
-    handler: NotificationHandler<ScopedPayload<P, T, F>>,
-  ): Unsubscribe
+  (sourceId: string, handler: NotificationHandler<P>, label?: string): Unsubscribe
 }
 
 /**
- * Register a handler for all devices or scoped to a source id. Always an options
- * object: `{}` (or `{ id: '*' }`) for all devices, `{ id }` for one.
+ * Register a handler for all devices (`'*'`) or one source id — the scope is
+ * **required** as the first argument. An optional unique `label` enables
+ * {@link RealtimeClient.unhook}.
  */
 export interface AnyRegister<P> {
-  <const T extends string | readonly string[] = string, const F extends readonly string[] = never>(
-    options: ScopeOptions<T, F> & { id?: SourceScope },
-    handler: NotificationHandler<ScopedPayload<P, T, F>>,
-  ): Unsubscribe
+  (scope: SourceScope, handler: NotificationHandler<P>, label?: string): Unsubscribe
 }
-
-/**
- * Back-compat alias for {@link AnyRegister}.
- */
-export type ScopedRegister<P> = AnyRegister<P>
 
 /**
  * Alarm / event / operation namespace — every action supports all or a device.
@@ -228,21 +202,25 @@ export interface ManagedObjectHooks {
 type DualScopeType = 'alarms' | 'events' | 'operations'
 
 /**
- * A typed hook key. The optional trailing `:sourceId` scopes to a device; it is
- * required for `measurements` and managed-object `update`/`delete`, and not
- * available for managed-object `create`.
+ * A typed hook key `"<type>:<action>:<scope>"`. The scope segment is **always
+ * required**: `'*'` for all devices, or a source id. For `measurements` and
+ * managed-object `update`/`delete` it must be a device id (no tenant-wide feed);
+ * for managed-object `create` it must be `'*'` (all-devices only).
  *
- * @example `'alarms:create'`, `'alarms:create:145075'`,
+ * The lone key `'*'` is the `onAny` firehose (every type, every action, all
+ * devices) — the key form of {@link RealtimeClient.onAny}.
+ *
+ * @example `'*'`, `'alarms:create:*'`, `'alarms:create:145075'`,
  * `'measurements:create:145075'`, `'managedobjects:update:145075'`
  */
 export type RealtimeHookKey
-  // all-devices (no id segment)
-  = | `${DualScopeType}:${HookActionName}`
-    | 'managedobjects:create'
-  // device-scoped (id segment)
-    | `${DualScopeType}:${HookActionName}:${string}`
+  // '<type>:<action>:<scope>' — scope is always present: '*' for all devices, or a source id
+  = | `${DualScopeType}:${HookActionName}:${string}`
     | `measurements:${HookActionName}:${string}`
+    | 'managedobjects:create:*'
     | `managedobjects:${'update' | 'delete'}:${string}`
+    // the onAny firehose: every type, every action, all devices
+    | '*'
 
 type ResolveHookPayload<T, A>
   = T extends NotificationTypeName
@@ -315,15 +293,42 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
    */
   dedupe?: boolean
   /**
-   * Delete the subscription resources this client created when {@link
+   * When the **last** handler for a `(type, scope)` is removed (via a handler's
+   * `Unsubscribe`, {@link RealtimeClient.unhook}, or {@link RealtimeClient.unsubscribe}),
+   * delete that scope's remote subscription and — once a whole type has no scopes
+   * left — close its consumer. Defaults to `true`.
+   *
+   * Set `false` to keep subscriptions durable (they survive having no handlers,
+   * so re-registering resumes without a re-create and no persistent backlog is
+   * lost). {@link RealtimeClient.unsubscribe} always deletes regardless; {@link
+   * RealtimeClient.detach} always keeps regardless.
+   */
+  deleteSubscriptionOnEmpty?: boolean
+  /**
+   * Delete **every** subscription resource this client created when {@link
    * RealtimeClient.close} is called. Useful for ephemeral/test clients so they
-   * leave nothing behind. Defaults to `false` (subscriptions are durable).
+   * leave nothing behind. Defaults to `false`.
    */
   deleteSubscriptionsOnClose?: boolean
 }
 
 const WILDCARD = '*'
 const DEDUPE_WINDOW = 2048
+
+/**
+ * One registered handler's bookkeeping. `subKey` (`${type}#${scope}`) identifies
+ * the shared single-type subscription; `hookKey` (`${scope}#${type}:${action}`)
+ * identifies the hookable bucket it fires from.
+ */
+interface HandlerEntry {
+  hookKey: string
+  subKey: string
+  type: string
+  scope: string
+  label: string | undefined
+  unhook: () => void
+  removed: boolean
+}
 
 /**
  * The high-level realtime client. Prefer {@link createRealtimeClient} to
@@ -336,6 +341,9 @@ const DEDUPE_WINDOW = 2048
  * handlers client-side by `sourceId`. This keeps deletes independent (removing
  * one handler never disturbs another) and bounds consumers to the number of
  * distinct types used, not the number of devices.
+ *
+ * Handlers registered under the same key fire **sequentially**, in registration
+ * order, each awaited before the next — matching `hookable`'s serial `callHook`.
  */
 export class RealtimeClient {
   /**
@@ -369,13 +377,26 @@ export class RealtimeClient {
   readonly #ensureSubscription: boolean
   readonly #autoStart: boolean
   readonly #dedupe: boolean
+  readonly #deleteSubscriptionOnEmpty: boolean
   readonly #deleteSubscriptionsOnClose: boolean
 
-  // One single-type subscription resource per `${type}#${scope}` (created once,
-  // never modified). `topicKey` is a notification type, or '*' for onAny.
-  readonly #subs = new Map<string, Promise<void>>()
+  // One single-type subscription per `${type}#${scope}`; the value resolves to
+  // its remote id (for deletion). `topicKey` is a notification type, or '*' for onAny.
+  readonly #subs = new Map<string, Promise<string | undefined>>()
+  // In-flight remote deletes per subKey. A re-subscribe waits for the pending
+  // delete to finish before recreating, so delete and create never race.
+  readonly #pendingDeletes = new Map<string, Promise<void>>()
   readonly #ownedSubscriptionIds: string[] = []
-  readonly #hookKeyCounts = new Map<string, number>()
+  // Per hookKey (`${scope}#${type}:${action}`), the live handler entries. The set
+  // size drives dispatch ("is anyone listening?"), hasHook, and hookKeys.
+  readonly #hookHandlers = new Map<string, Set<HandlerEntry>>()
+  // Live handler count per subKey (`${type}#${scope}`), across all its actions —
+  // drives delete-on-empty for the shared single-type subscription.
+  readonly #subHandlerCount = new Map<string, number>()
+  // Active scopes per type, for closing a type's consumer once its last scope goes.
+  readonly #typeScopes = new Map<string, Set<string>>()
+  // Unique-per-client handler labels → entry, for unhook(label).
+  readonly #labels = new Map<string, HandlerEntry>()
 
   // One consumer per topicKey (per type + '*' for onAny).
   readonly #topicKeys = new Set<string>()
@@ -405,6 +426,7 @@ export class RealtimeClient {
     this.#ensureSubscription = options.ensureSubscription ?? true
     this.#autoStart = options.autoStart ?? true
     this.#dedupe = options.dedupe ?? true
+    this.#deleteSubscriptionOnEmpty = options.deleteSubscriptionOnEmpty ?? true
     this.#deleteSubscriptionsOnClose = options.deleteSubscriptionsOnClose ?? false
 
     this.alarms = this.#dualNamespace<Alarm>('alarms')
@@ -438,51 +460,157 @@ export class RealtimeClient {
   }
 
   /**
-   * Register a typed handler using a `"<type>:<action>"` key, with the source id
-   * optionally embedded as a third segment (`"<type>:<action>:<sourceId>"`). The
-   * id is required for `measurements` and managed-object `update`/`delete`, and
-   * unavailable for managed-object `create`. The payload type is inferred.
+   * Register a typed handler using a `"<type>:<action>:<scope>"` key. The scope
+   * segment is **required**: `'*'` for all devices, or a source id (required for
+   * `measurements` and managed-object `update`/`delete`; must be `'*'` for
+   * managed-object `create`). The payload type is inferred from the key. An
+   * optional unique `label` enables {@link unhook}.
    *
-   * Always an options object (a single object signature — no string/union — so
-   * `{ … }` gets clean property completion for `key`, `typeFilter`,
-   * `fragmentsToCopy`).
-   *
-   * @param options
+   * @param key
    * @param handler
+   * @param label
    * @example
    * ```ts
-   * rt.hook({ key: 'alarms:create' }, (alarm) => {})              // all devices
-   * rt.hook({ key: 'alarms:create:145075' }, (alarm) => {})       // only device 145075
-   * rt.hook({ key: 'measurements:create:145075' }, (m) => {})     // id required
-   * rt.hook({ key: 'managedobjects:delete:145075' }, ({ id }) => {})
+   * rt.hook('alarms:create:*', (alarm) => {})            // all devices
+   * rt.hook('alarms:create:145075', (alarm) => {})       // only device 145075
+   * rt.hook('measurements:create:145075', (m) => {})     // id required
+   * rt.hook('managedobjects:delete:145075', ({ id }) => {})
+   * rt.hook('*', (payload, n) => {}) // firehose — same as rt.onAny(handler)
    * ```
    */
-  hook<K extends RealtimeHookKey, const T extends string | readonly string[] = string, const F extends readonly string[] = never>(
-    options: ScopeOptions<T, F> & { key: K },
-    handler: NotificationHandler<ScopedPayload<HookKeyPayload<K>, T, F>>,
+  hook<K extends RealtimeHookKey>(
+    key: K,
+    handler: NotificationHandler<HookKeyPayload<K>>,
+    label?: string,
   ): Unsubscribe {
-    const { key } = options
-    const filter: ScopeFilter = {
-      typeFilter: options.typeFilter,
-      fragmentsToCopy: options.fragmentsToCopy ? [...options.fragmentsToCopy] : undefined,
-    }
+    if (key === WILDCARD)
+      return this.#register(WILDCARD, WILDCARD, WILDCARD, handler as unknown as NotificationHandler<unknown>, label)
     const [type = '', action = '', id] = key.split(':')
     const scope = id && id.length > 0 ? id : WILDCARD
-    return this.#register(scope, type, action, handler as unknown as NotificationHandler<unknown>, filter)
+    return this.#register(scope, type, action, handler as unknown as NotificationHandler<unknown>, label)
   }
 
   /**
-   * Register a handler for every notification, or for one device's feed.
+   * Register a handler for every notification, or for one device's feed. Unlike
+   * the keyed registers, the scope here is **optional** — omit it for all
+   * devices, or pass a source id for one. An optional unique `label` enables
+   * {@link unhook}.
+   *
+   * The **all-devices** firehose (internal `*#*:*`) has the public key `'*'`, so
+   * it is listed by {@link hookKeys} and removable via `unsubscribe('*')` /
+   * `hasHook('*')` (or `rt.hook('*', handler)` to register). A **scoped** firehose
+   * (`rt.onAny(sourceId, …)`, internal `<sourceId>#*:*`) has no key form — remove
+   * it via the returned {@link Unsubscribe} or a `label`.
+   * @param a
+   * @param b
+   * @param c
    */
-  onAny(handler: NotificationHandler<unknown>): Unsubscribe
-  onAny(sourceId: string, handler: NotificationHandler<unknown>): Unsubscribe
-  onAny(options: ScopeFilter & { id?: string }, handler: NotificationHandler<unknown>): Unsubscribe
+  onAny(handler: NotificationHandler<unknown>, label?: string): Unsubscribe
+  onAny(scope: SourceScope, handler: NotificationHandler<unknown>, label?: string): Unsubscribe
   onAny(
-    a: string | (ScopeFilter & { id?: string }) | NotificationHandler<unknown>,
-    b?: NotificationHandler<unknown>,
+    a: string | NotificationHandler<unknown>,
+    b?: string | NotificationHandler<unknown>,
+    c?: string,
   ): Unsubscribe {
-    const { scope, filter, handler } = parseScopeArgs(a, b)
-    return this.#register(scope, WILDCARD, WILDCARD, handler, filter)
+    const scope = typeof a === 'string' && a.length > 0 ? a : WILDCARD
+    const handler = typeof a === 'function' ? a : b
+    const label = typeof a === 'function' ? (typeof b === 'string' ? b : undefined) : c
+    if (typeof handler !== 'function')
+      throw new TypeError('A notification handler function is required')
+    return this.#register(scope, WILDCARD, WILDCARD, handler, label)
+  }
+
+  /**
+   * Remove **all** handlers registered under a hook key and report how many were
+   * removed. The key uses the same grammar as {@link hook} —
+   * `"<type>:<action>:<scope>"` (`'*'` = all devices).
+   *
+   * **Always** deletes the underlying single-type subscription once removing
+   * these handlers leaves the `(type, scope)` with none (regardless of the
+   * `deleteSubscriptionOnEmpty` option) — and closes the type's consumer if that
+   * was its last scope. Note the subscription is shared across a `(type, scope)`'s
+   * actions: `unsubscribe('alarms:create:*')` won't delete the remote while
+   * `alarms:update:*` still has a handler. Use {@link detach} to remove handlers
+   * but keep the subscription.
+   *
+   * @param key
+   * @returns `{ removed, count }` — `removed` is `true` when at least one handler
+   *   was removed; `count` is how many (`0` when the key had none registered).
+   * @example
+   * ```ts
+   * rt.unsubscribe('alarms:create:145075') // → { removed: true, count: 2, subscriptionDeleted: true }
+   * rt.unsubscribe('events:update:*')      // → { removed: false, count: 0, subscriptionDeleted: false }
+   * ```
+   */
+  unsubscribe(key: RealtimeHookKey): UnsubscribeResult {
+    return this.#removeAll(toHookKey(key), true)
+  }
+
+  /**
+   * Remove **all** handlers registered under a hook key but **keep** the remote
+   * subscription and its consumer alive (regardless of `deleteSubscriptionOnEmpty`),
+   * so re-registering later resumes without re-creating the subscription.
+   *
+   * ⚠️ Use only when you intend to resume. A persistent subscription left with no
+   * handlers still counts against your subscription quota, keeps being delivered
+   * (and, with `autoAck`, dropped) — and if you disabled `autoAck`, its backlog
+   * grows unacknowledged until TTL/quota. If you do **not** intend to resume, use
+   * {@link unsubscribe} instead so nothing is left dangling.
+   *
+   * @param key
+   * @returns `{ removed, count }` — same shape as {@link unsubscribe}.
+   */
+  detach(key: RealtimeHookKey): UnsubscribeResult {
+    return this.#removeAll(toHookKey(key), false)
+  }
+
+  /**
+   * Remove the single handler registered under `label` (labels are unique per
+   * client — see the register `label` argument). Follows the
+   * `deleteSubscriptionOnEmpty` policy if it was the last handler for its
+   * `(type, scope)`.
+   * @param label
+   * @returns `{ removed, subscriptionDeleted }` — `removed` is `false` when no
+   *   such label was registered; `subscriptionDeleted` is `true` when this was
+   *   the last handler for its `(type, scope)` and the remote sub was removed.
+   */
+  unhook(label: string): UnhookResult {
+    const entry = this.#labels.get(label)
+    if (!entry || !this.#detachEntry(entry))
+      return { removed: false, subscriptionDeleted: false }
+    const subscriptionDeleted = this.#teardownIfEmpty(entry, this.#deleteSubscriptionOnEmpty)
+    return { removed: true, subscriptionDeleted }
+  }
+
+  /**
+   * Whether at least one handler is currently registered under a hook key (same
+   * `"<type>:<action>:<scope>"` grammar as {@link hook}).
+   * @param key
+   */
+  hasHook(key: RealtimeHookKey): boolean {
+    return (this.#hookHandlers.get(toHookKey(key))?.size ?? 0) > 0
+  }
+
+  /**
+   * List the keyed hooks that currently have at least one handler, in the public
+   * `"<type>:<action>:<scope>"` form (`'*'` in the scope = all devices), plus the
+   * lone `'*'` when an all-devices {@link onAny} firehose is registered. Every
+   * entry is a valid {@link RealtimeHookKey} you can pass straight back to
+   * {@link hasHook} / {@link unsubscribe}.
+   *
+   * The **scoped** `onAny` surfaces (`rt.onAny(sourceId, …)` and the per-type
+   * `rt.<type>.onAny(…)`) have no valid key form, so they are **not** listed.
+   * Manage those via the returned {@link Unsubscribe} or a `label`.
+   *
+   * @example `['*', 'alarms:create:*', 'alarms:create:145075', 'events:update:*']`
+   */
+  hookKeys(): RealtimeHookKey[] {
+    const keys: RealtimeHookKey[] = []
+    for (const hookKey of this.#hookHandlers.keys()) {
+      if (isKeyedHook(hookKey))
+        keys.push(toPublicKey(hookKey) as RealtimeHookKey)
+    }
+    return keys
   }
 
   /**
@@ -521,9 +649,9 @@ export class RealtimeClient {
   }
 
   #reg<P, R>(type: string, action: string): R {
-    return ((a: unknown, b?: NotificationHandler<P>) => {
-      const { scope, filter, handler } = parseScopeArgs(a, b as NotificationHandler<unknown> | undefined)
-      return this.#register(scope, type, action, handler, filter)
+    return ((a: unknown, b?: NotificationHandler<P>, c?: string) => {
+      const { scope, handler, label } = parseScopeArgs(a, b as NotificationHandler<unknown> | undefined, c)
+      return this.#register(scope, type, action, handler, label)
     }) as R
   }
 
@@ -541,27 +669,153 @@ export class RealtimeClient {
 
   // ── registration & dispatch ──────────────────────────────────────────────
 
-  #register(scope: string, type: string, action: string, handler: NotificationHandler<unknown>, filter?: ScopeFilter): Unsubscribe {
+  #register(scope: string, type: string, action: string, handler: NotificationHandler<unknown>, label?: string): Unsubscribe {
+    if (label != null && this.#labels.has(label)) {
+      throw new Error(
+        `realtime: a hook labeled ${JSON.stringify(label)} is already registered on this client; labels must be unique.`,
+      )
+    }
     const hookKey = `${scope}#${type}:${action}`
+    const subKey = `${type}#${scope}`
     const wrapped = (payload: unknown, notification: Notification<unknown>): void | Promise<void> =>
       handler(payload, notification)
     const unhook = this.#hooks.hook(hookKey, wrapped as never)
-    this.#hookKeyCounts.set(hookKey, (this.#hookKeyCounts.get(hookKey) ?? 0) + 1)
+    const entry: HandlerEntry = { hookKey, subKey, type, scope, label, unhook, removed: false }
+
+    let set = this.#hookHandlers.get(hookKey)
+    if (!set) {
+      set = new Set()
+      this.#hookHandlers.set(hookKey, set)
+    }
+    set.add(entry)
+    if (label != null)
+      this.#labels.set(label, entry)
+    this.#subHandlerCount.set(subKey, (this.#subHandlerCount.get(subKey) ?? 0) + 1)
+    let scopes = this.#typeScopes.get(type)
+    if (!scopes) {
+      scopes = new Set()
+      this.#typeScopes.set(type, scopes)
+    }
+    scopes.add(scope)
 
     // `type` is a notification type, or '*' for onAny — that is the topicKey.
     this.#topicKeys.add(type)
-    this.#ensureSub(type, scope, filter)
+    this.#ensureSub(type, scope)
     if (this.#autoStart)
       this.#ensureTopicConsumer(type)
 
+    // Idempotent: safe to call twice, or after unsubscribe/detach already removed
+    // it — a second call is a no-op.
     return () => {
-      unhook()
-      const remaining = (this.#hookKeyCounts.get(hookKey) ?? 1) - 1
-      if (remaining <= 0)
-        this.#hookKeyCounts.delete(hookKey)
-      else
-        this.#hookKeyCounts.set(hookKey, remaining)
+      if (this.#detachEntry(entry))
+        this.#teardownIfEmpty(entry, this.#deleteSubscriptionOnEmpty)
     }
+  }
+
+  /**
+   * Detach every handler under a hookKey. `deleteRemote` chooses the remote
+   * policy: `true` (unsubscribe) deletes the subscription when the `(type,scope)`
+   * empties; `false` (detach) keeps it.
+   * @param hookKey
+   * @param deleteRemote
+   */
+  #removeAll(hookKey: string, deleteRemote: boolean): UnsubscribeResult {
+    const set = this.#hookHandlers.get(hookKey)
+    if (!set || set.size === 0)
+      return { removed: false, count: 0, subscriptionDeleted: false }
+    const entries = [...set]
+    let count = 0
+    for (const entry of entries) {
+      if (this.#detachEntry(entry))
+        count += 1
+    }
+    const subscriptionDeleted = deleteRemote && entries[0] ? this.#teardownIfEmpty(entries[0], true) : false
+    return { removed: count > 0, count, subscriptionDeleted }
+  }
+
+  /**
+   * Remove one handler from hookable + all bookkeeping. Returns `true` if this
+   * call removed it (idempotent — `false` if already removed).
+   * @param entry
+   */
+  #detachEntry(entry: HandlerEntry): boolean {
+    if (entry.removed)
+      return false
+    entry.removed = true
+    entry.unhook()
+    const set = this.#hookHandlers.get(entry.hookKey)
+    set?.delete(entry)
+    if (set && set.size === 0)
+      this.#hookHandlers.delete(entry.hookKey)
+    if (entry.label != null)
+      this.#labels.delete(entry.label)
+    const remaining = (this.#subHandlerCount.get(entry.subKey) ?? 1) - 1
+    if (remaining <= 0)
+      this.#subHandlerCount.delete(entry.subKey)
+    else
+      this.#subHandlerCount.set(entry.subKey, remaining)
+    return true
+  }
+
+  /**
+   * If a `(type, scope)` now has no handlers and `deleteRemote` is set, delete its
+   * remote subscription and — if the type has no scopes left — close its consumer.
+   * @param entry
+   * @param deleteRemote
+   */
+  #teardownIfEmpty(entry: HandlerEntry, deleteRemote: boolean): boolean {
+    if (!deleteRemote)
+      return false
+    if ((this.#subHandlerCount.get(entry.subKey) ?? 0) > 0)
+      return false // another action for this (type, scope) still has a handler
+    this.#deleteRemoteSub(entry.subKey)
+    const scopes = this.#typeScopes.get(entry.type)
+    if (scopes) {
+      scopes.delete(entry.scope)
+      if (scopes.size === 0) {
+        this.#typeScopes.delete(entry.type)
+        this.#closeConsumer(entry.type)
+      }
+    }
+    return true
+  }
+
+  /**
+   * Delete a `(type, scope)`'s remote subscription (best-effort, in the
+   * background) and forget it so a later registration re-creates it.
+   * @param subKey
+   */
+  #deleteRemoteSub(subKey: string): void {
+    const idPromise = this.#subs.get(subKey)
+    this.#subs.delete(subKey)
+    if (!idPromise)
+      return
+    // Record the in-flight delete so a re-subscribe of the same `(type, scope)`
+    // waits for it to finish before creating (see #ensureSub) — otherwise the
+    // create could land first and this delete would then remove it, leaving the
+    // client silently unsubscribed.
+    const done: Promise<void> = Promise.resolve(idPromise)
+      .then((id) => (id ? this.#client.subscriptions.delete(id).catch(() => {}) : undefined))
+      .catch(() => {})
+      .finally(() => {
+        if (this.#pendingDeletes.get(subKey) === done)
+          this.#pendingDeletes.delete(subKey)
+      })
+    this.#pendingDeletes.set(subKey, done)
+  }
+
+  /**
+   * Close and forget a type's consumer so a later registration re-opens it.
+   * @param topicKey
+   */
+  #closeConsumer(topicKey: string): void {
+    const close = this.#topicConsumers.get(topicKey)
+    this.#topicConsumers.delete(topicKey)
+    this.#topicStarted.delete(topicKey)
+    this.#topicKeys.delete(topicKey)
+    this.#dedup.delete(topicKey)
+    if (close)
+      close().catch(() => {})
   }
 
   #topicName(topicKey: string): string {
@@ -570,17 +824,16 @@ export class RealtimeClient {
 
   /**
    * Ensure the single-type subscription for `(type, scope)` exists. Created once;
-   * never modified (its apis are exactly `[type]`, or `['*']` for onAny). The
-   * first registration's `filter` (typeFilter / fragmentsToCopy) is applied.
+   * never modified. Its apis are exactly `[type]` (or `['*']` for onAny) and it
+   * forwards the **full** message — no `typeFilter`, no `fragmentsToCopy`, so any
+   * number of handlers can share one `(type, scope)` stream without conflict.
    * @param type
    * @param scope
-   * @param filter
    */
-  #ensureSub(type: string, scope: string, filter?: ScopeFilter): void {
+  #ensureSub(type: string, scope: string): void {
     const key = `${type}#${scope}`
     if (this.#subs.has(key) || !this.#ensureSubscription)
       return
-    const typeFilter = buildTypeFilter(filter?.typeFilter)
     const isTenant = scope === WILDCARD
     const subscription: Subscription = {
       context: isTenant ? 'tenant' : 'mo',
@@ -589,18 +842,22 @@ export class RealtimeClient {
       nonPersistent: this.#nonPersistent,
       subscriptionFilter: {
         apis: type === WILDCARD ? [...this.#apis] : [type as SubscriptionApi],
-        ...(typeFilter ? { typeFilter } : {}),
       },
-      ...(filter?.fragmentsToCopy?.length ? { fragmentsToCopy: [...filter.fragmentsToCopy] } : {}),
     }
-    const promise = this.#client.subscriptions.ensure(subscription)
+    // If a delete for this `(type, scope)` is still in flight, wait for it to
+    // finish before creating, so the create can't be undone by the late delete.
+    const pending = this.#pendingDeletes.get(key)
+    const promise = (pending ?? Promise.resolve())
+      .then(() => this.#client.subscriptions.ensure(subscription))
       .then((created) => {
         if (created.id)
           this.#ownedSubscriptionIds.push(created.id)
+        return created.id
       })
       .catch((error) => {
         if (!this.#closing)
           this.#logger.error(`realtime: failed to ensure subscription ${key}`, error)
+        return undefined
       })
     this.#subs.set(key, promise)
   }
@@ -661,7 +918,7 @@ export class RealtimeClient {
         ])
     let handled = false
     for (const key of keys) {
-      if ((this.#hookKeyCounts.get(key) ?? 0) > 0)
+      if ((this.#hookHandlers.get(key)?.size ?? 0) > 0)
         handled = true
       await this.#hooks.callHook(key, notification.payload, notification)
     }
@@ -705,44 +962,65 @@ function capitalize(value: string): string {
 }
 
 /**
- * Build a Notification 2.0 `typeFilter` from raw type name(s). Each name is
- * wrapped in single quotes (any internal quote doubled, per OData) and names are
- * combined with `or`: `['a', 'b']` → `'a' or 'b'`; `'a'` → `'a'`. Returns
- * `undefined` for an empty/absent filter.
- * @param typeFilter
+ * Map a public hook key `"<type>:<action>:<scope>"` to the internal
+ * `"<scope>#<type>:<action>"` form (an absent/empty scope ⇒ the `*` scope).
+ * Mirrors the scope resolution in {@link RealtimeClient.hook}.
+ * @param key
  */
-function buildTypeFilter(typeFilter: string | readonly string[] | undefined): string | undefined {
-  if (typeFilter == null)
-    return undefined
-  const names = (Array.isArray(typeFilter) ? typeFilter : [typeFilter]).filter((name) => name.length > 0)
-  if (names.length === 0)
-    return undefined
-  return names.map((name) => `'${name.replaceAll('\'', '\'\'')}'`).join(' or ')
+function toHookKey(key: string): string {
+  if (key === WILDCARD)
+    return `${WILDCARD}#${WILDCARD}:${WILDCARD}`
+  const [type = '', action = '', id] = key.split(':')
+  const scope = id && id.length > 0 ? id : WILDCARD
+  return `${scope}#${type}:${action}`
 }
 
 /**
- * Normalize a registration's scope argument (a handler, a source-id string, or a
- * `{ id?, ...filter }` object) plus the trailing handler into `{ scope, filter,
- * handler }`.
+ * Inverse of {@link toHookKey}: map an internal `"<scope>#<type>:<action>"` key
+ * back to the public `"<type>:<action>:<scope>"` form (the scope segment is
+ * always present, `'*'` for all devices).
+ * @param hookKey
+ */
+function toPublicKey(hookKey: string): string {
+  if (hookKey === `${WILDCARD}#${WILDCARD}:${WILDCARD}`)
+    return WILDCARD
+  const hash = hookKey.indexOf('#')
+  const scope = hookKey.slice(0, hash)
+  const typeAction = hookKey.slice(hash + 1)
+  return `${typeAction}:${scope}`
+}
+
+/**
+ * Whether an internal hookKey maps to a valid {@link RealtimeHookKey}. That's
+ * either a concrete keyed registration (`hook()` / `onCreate`/`onUpdate`/
+ * `onDelete`) or the global `onAny` firehose `*#*:*` (public key `'*'`). The
+ * **scoped** `onAny` surfaces — a per-device firehose (`<id>#*:*`) or a per-type
+ * `rt.<type>.onAny` (`*#<type>:*`) — have no key form and are excluded.
+ * @param hookKey
+ */
+function isKeyedHook(hookKey: string): boolean {
+  if (hookKey === `${WILDCARD}#${WILDCARD}:${WILDCARD}`)
+    return true
+  const [type = '', action = ''] = hookKey.slice(hookKey.indexOf('#') + 1).split(':')
+  return type !== WILDCARD && action !== WILDCARD
+}
+
+/**
+ * Normalize a namespace register's `(scope, handler, label?)` arguments. The
+ * scope is required (a `'*'`/id string); an empty string is treated as the
+ * all-devices `*` scope.
  * @param a
  * @param b
+ * @param c
  */
 function parseScopeArgs(
   a: unknown,
   b: NotificationHandler<unknown> | undefined,
-): { scope: string, filter: ScopeFilter | undefined, handler: NotificationHandler<unknown> } {
-  if (typeof a === 'function')
-    return { scope: WILDCARD, filter: undefined, handler: a as NotificationHandler<unknown> }
-  if (!b)
-    throw new TypeError('A notification handler function is required')
-  if (typeof a === 'string')
-    return { scope: a, filter: undefined, handler: b }
-  const options = a as ScopeFilter & { id?: string }
-  return {
-    scope: options.id ?? WILDCARD,
-    filter: { typeFilter: options.typeFilter, fragmentsToCopy: options.fragmentsToCopy },
-    handler: b,
-  }
+  c: string | undefined,
+): { scope: string, handler: NotificationHandler<unknown>, label: string | undefined } {
+  if (typeof a !== 'string' || typeof b !== 'function')
+    throw new TypeError('A source scope ("*" for all devices, or a device id) and a handler function are required')
+  return { scope: a.length > 0 ? a : WILDCARD, handler: b, label: typeof c === 'string' ? c : undefined }
 }
 
 /**
@@ -751,10 +1029,10 @@ function parseScopeArgs(
  * @param options
  * @example
  * ```ts
- * const rt = createRealtimeClient({ baseUrl, tenant, user, password })
- * rt.alarms.onCreate({}, (alarm) => console.log(alarm.severity))            // all devices
- * rt.measurements.onCreate({ id: '12345' }, (m) => console.log(m.type))     // one device
- * rt.hook({ key: 'managedobjects:update:12345' }, (mo) => console.log(mo.id))
+ * const rt = createRealtimeClient({ name, baseUrl, tenant, user, password })
+ * rt.alarms.onCreate('*', (alarm) => console.log(alarm.severity))      // all devices
+ * rt.measurements.onCreate('12345', (m) => console.log(m.type))        // one device
+ * rt.hook('managedobjects:update:12345', (mo) => console.log(mo.id))
  * ```
  */
 export function createRealtimeClient(options: RealtimeClientOptions): RealtimeClient {

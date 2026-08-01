@@ -2,8 +2,9 @@
  * c8y-realtime — a standalone, dependency-light TypeScript SDK for the
  * Cumulocity IoT Notification 2.0 API.
  *
- * Zero dependency on `@c8y/client`. Native `fetch` for REST and `ws` (or the
- * native `WebSocket`) for the consumer. ESM only, strict TypeScript.
+ * Zero dependency on `@c8y/client`. Native `fetch` for REST and the runtime's
+ * global `WebSocket` for the consumer (override via `webSocketImpl`, e.g. to
+ * inject `ws`). ESM only, strict TypeScript.
  *
  * @example Single tenant
  * ```ts
@@ -26,7 +27,7 @@
  * ```
  */
 
-export { createMultiTenantClient, createNotificationClient, NotificationClient } from './client'
+export { createNotificationClient, NotificationClient } from './client'
 export { WebSocketConsumer } from './consumer'
 export { C8yConnectionError, C8yError, C8yHttpError } from './errors'
 export { parseDescription, parseFrame, parsePayload } from './frame'
@@ -56,7 +57,6 @@ export type { ParsedFrame } from './frame'
 export type {
   AllRegister,
   AnyRegister,
-  FragmentPayload,
   HookKeyPayload,
   IdRegister,
   ManagedObjectHooks,
@@ -65,11 +65,10 @@ export type {
   RealtimeClientOptions,
   RealtimeHookKey,
   RealtimeSubscriptionOptions,
-  ScopedPayload,
-  ScopedRegister,
-  ScopeFilter,
   TypeHooks,
+  UnhookResult,
   Unsubscribe,
+  UnsubscribeResult,
 } from './realtime'
 export type {
   ConsumerResilienceOptions,

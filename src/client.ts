@@ -132,33 +132,6 @@ export function createNotificationClient(options: NotificationClientOptions): No
   return new NotificationClient(options)
 }
 
-/**
- * Build one {@link NotificationClient} per tenant credential, keyed by tenant
- * id, for fan-out across all subscribed tenants of a multitenant microservice.
- *
- * @param baseUrl - Shared base URL used when a credential does not carry its own.
- * @param credentials - Per-tenant credentials.
- * @param shared
- */
-export function createMultiTenantClient(
-  baseUrl: string,
-  credentials: TenantCredentials[],
-  shared?: Pick<NotificationClientOptions, 'resilience' | 'logger' | 'webSocketImpl' | 'fetchImpl'>,
-): Map<string, NotificationClient> {
-  const clients = new Map<string, NotificationClient>()
-  for (const credential of credentials) {
-    const client = createNotificationClient({
-      baseUrl: credential.baseUrl || baseUrl,
-      tenant: credential.tenant,
-      user: credential.user,
-      password: credential.password,
-      ...shared,
-    })
-    clients.set(credential.tenant, client)
-  }
-  return clients
-}
-
 // ── internal helpers ─────────────────────────────────────────────────────────
 
 function memoize<T>(factory: () => Promise<T>): () => Promise<T> {
@@ -167,23 +140,17 @@ function memoize<T>(factory: () => Promise<T>): () => Promise<T> {
 }
 
 /**
- * Resolve a WebSocket implementation: an explicit override, else the `ws`
- * package (preferred for ping/pong keepalive), else the global `WebSocket`.
+ * Resolve a WebSocket implementation: an explicit override, else the runtime's
+ * global `WebSocket` (Node 22+, browsers, and other modern runtimes).
  * @param override
  */
-async function resolveWebSocket(override?: WebSocketFactory): Promise<WebSocketFactory> {
+function resolveWebSocket(override?: WebSocketFactory): Promise<WebSocketFactory> {
   if (override)
-    return override
-  try {
-    const mod = await import('ws')
-    const impl = (mod as { WebSocket?: unknown, default?: unknown }).WebSocket ?? mod.default
-    if (typeof impl === 'function')
-      return impl as WebSocketFactory
-  } catch {
-    // `ws` not installed — fall through to the global WebSocket if present.
-  }
+    return Promise.resolve(override)
   const globalWebSocket = (globalThis as { WebSocket?: unknown }).WebSocket
   if (typeof globalWebSocket === 'function')
-    return globalWebSocket as WebSocketFactory
-  throw new Error('No WebSocket implementation available. Install `ws` or provide options.webSocketImpl.')
+    return Promise.resolve(globalWebSocket as WebSocketFactory)
+  return Promise.reject(
+    new Error('No global WebSocket found — use Node 22+ (or a runtime with a global WebSocket), or pass options.webSocketImpl.'),
+  )
 }
