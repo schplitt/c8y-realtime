@@ -70,6 +70,7 @@ import type {
   NotificationClientOptions,
   Subscription,
   SubscriptionApi,
+  TenantCredentials,
 } from './types'
 
 /**
@@ -451,6 +452,9 @@ export class RealtimeClient {
   readonly #topicKeys = new Set<string>()
   readonly #topicStarted = new Set<string>()
   readonly #topicConsumers = new Map<string, () => Promise<void>>()
+  // Topics whose consumer ended on its own (fatal error — e.g. revoked creds),
+  // NOT via an intentional close. Drained by updateCredentials to restart them.
+  readonly #stoppedTopics = new Set<string>()
 
   // Per-topic bounded duplicate suppression (must be per-topic: the same event
   // legitimately arrives on both its type topic and the onAny topic).
@@ -674,6 +678,79 @@ export class RealtimeClient {
   }
 
   /**
+   * `true` while no consumer has stopped unexpectedly — i.e. the client is
+   * running normally (or has nothing to run). Goes `false` when a consumer hits
+   * a fatal error (e.g. its credentials ran out) and gives up. A live socket
+   * still holds a valid token, so it stays healthy until it drops. This is the
+   * gate for {@link updateCredentials}: you may only replace credentials while
+   * `healthy` is `false`.
+   */
+  get healthy(): boolean {
+    return this.#stoppedTopics.size === 0
+  }
+
+  /**
+   * Replace this client's credentials **after it has gone unhealthy** — a
+   * consumer stopped because its credentials ran out (rotation) or were revoked
+   * (unsubscribe→resubscribe). Handlers and remote subscriptions are kept; the
+   * stopped consumers are reconnected with the new credentials. The `tenant` and
+   * `baseUrl` must stay the same — only the user/password may change (a different
+   * tenant is a different client).
+   *
+   * You may **only** call this while {@link healthy} is `false`. Replacing the
+   * credentials of a live, healthy client is not allowed — its sockets already
+   * hold valid tokens, so there is nothing to repair — and the promise
+   * **rejects** without touching anything.
+   *
+   * When unhealthy, it then **validates** the new credentials with one read-only
+   * probe:
+   *
+   * - **They fail to authenticate** → the promise **rejects and nothing
+   *   changes**. The previous credentials are kept (they were valid at some
+   *   point), the client stays unhealthy, and the caller can retry with the next
+   *   set of credentials.
+   * - **They authenticate** → swap the credential source (every future token
+   *   mint and REST call uses them), then restart exactly the stopped consumers,
+   *   reusing their remote subscriptions. Any still-healthy consumer keeps its
+   *   socket and migrates on its own next natural reconnect — no forced drop.
+   *
+   * @param credentials - The replacement tenant credentials.
+   * @throws if the client is still {@link healthy}, or if the new credentials do
+   *   not authenticate — in either case the client is left unchanged.
+   */
+  async updateCredentials(credentials: TenantCredentials): Promise<void> {
+    // A healthy client has nothing to repair: its live sockets still hold valid
+    // tokens. Swapping creds underneath them is disallowed — reject untouched.
+    if (this.healthy) {
+      throw new Error(
+        'realtime: cannot update credentials while the client is healthy — credentials can only be replaced after a consumer has stopped (e.g. its credentials ran out).',
+      )
+    }
+
+    // Validate against a throwaway client, so bad credentials never clobber the
+    // previous (once-valid) ones. Throws (e.g. 401/403) without side effects.
+    await this.#client.verifyCredentials(credentials)
+
+    // Validated — swap the source in memory. Any still-healthy socket keeps running.
+    this.#client.setCredentials(credentials)
+
+    // Restart exactly the topics whose consumer had already stopped.
+    // Reuse the existing remote subscription (#subs untouched); just re-open the
+    // consumer, which re-mints a token from the new credentials. Dedup state is
+    // preserved (we do not route through #closeConsumer) so a persistent resume
+    // does not re-fire already-processed messages.
+    for (const topicKey of [...this.#stoppedTopics]) {
+      this.#stoppedTopics.delete(topicKey)
+      // A topic can only be restarted if it is still wanted (handlers remain).
+      if (!this.#topicKeys.has(topicKey))
+        continue
+      this.#topicConsumers.delete(topicKey)
+      this.#topicStarted.delete(topicKey)
+      this.#ensureTopicConsumer(topicKey)
+    }
+  }
+
+  /**
    * Stop consuming and release resources.
    */
   async close(): Promise<void> {
@@ -863,6 +940,9 @@ export class RealtimeClient {
     this.#topicStarted.delete(topicKey)
     this.#topicKeys.delete(topicKey)
     this.#dedup.delete(topicKey)
+    // The topic is being intentionally removed — never let a prior unexpected
+    // stop resurrect it on the next updateCredentials.
+    this.#stoppedTopics.delete(topicKey)
     if (close)
       close().catch(() => {})
   }
@@ -939,6 +1019,14 @@ export class RealtimeClient {
       } catch (error) {
         this.#logger.error('notification handler threw', error)
       }
+    }
+    // The consumer's run loop ended. An intentional teardown (#closeConsumer /
+    // close()) clears #topicStarted first, or sets #closing — so if the topic is
+    // still started and we are not closing, it stopped on its own (a fatal error
+    // such as revoked credentials). Mark it for updateCredentials to restart.
+    if (!this.#closing && this.#topicStarted.has(topicKey)) {
+      this.#stoppedTopics.add(topicKey)
+      this.#logger.warn(`realtime: consumer for ${this.#topicName(topicKey)} stopped unexpectedly (call updateCredentials to restart it)`)
     }
   }
 

@@ -745,3 +745,150 @@ describe('realtimeClient — acknowledgement', () => {
     await rt.close()
   })
 })
+
+describe('realtimeClient — updateCredentials (repair after creds run out)', () => {
+  /**
+   * A fetch that records the `Authorization` header seen on token mints and on
+   * subscription list calls, and can be switched to fail either endpoint. The
+   * minted token embeds the topic name (so `socketFor` can find its socket).
+   */
+  function credFetch() {
+    const state = {
+      tokenAuth: [] as string[],
+      listAuth: [] as string[],
+      failTokenStatus: 0,
+      failListStatus: 0,
+    }
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string, headers?: Record<string, string> }) => {
+      const method = init?.method ?? 'GET'
+      const auth = init?.headers?.Authorization ?? ''
+      const body = init?.body ? JSON.parse(init.body) as { subscription?: string } : {}
+      if (url.includes('notification2/token')) {
+        state.tokenAuth.push(auth)
+        return state.failTokenStatus ? json({ error: 'unauthorized' }, state.failTokenStatus) : json({ token: `tok-${body.subscription}` })
+      }
+      if (url.includes('notification2/subscriptions') && method === 'POST')
+        return json({ id: `sub-${body.subscription}`, ...body }, 201)
+      // GET notification2/subscriptions — the updateCredentials auth probe.
+      state.listAuth.push(auth)
+      return state.failListStatus ? json({ error: 'unauthorized' }, state.failListStatus) : json({ subscriptions: [] })
+    }) as unknown as typeof fetch
+    return { fetchImpl, state }
+  }
+
+  function makeCredRealtime(fetchImpl: typeof fetch) {
+    return createRealtimeClient({
+      name: 'c8yRealtime',
+      baseUrl: 'https://a.com',
+      tenant: 't',
+      user: 'u',
+      password: 'p',
+      webSocketImpl: MockSocket as unknown as WebSocketFactory,
+      fetchImpl,
+      resilience: { pingIntervalMs: 10_000, pongTimeoutMs: 10_000, initialBackoffMs: 5, maxBackoffMs: 20 },
+    })
+  }
+
+  it('rejects updating a healthy client and changes nothing', async () => {
+    MockSocket.reset()
+    const { fetchImpl, state } = credFetch()
+    const rt = makeCredRealtime(fetchImpl)
+    rt.alarms.onCreate('*', () => {})
+    const socket = await socketFor('c8yRealtimeAlarms')
+    await waitFor(() => state.tokenAuth.length >= 1)
+    const oldAuth = state.tokenAuth[0]
+    expect(rt.healthy).toBe(true)
+
+    await expect(
+      rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p2' }),
+    ).rejects.toThrow(/healthy/)
+
+    // Nothing was disturbed: no validation probe ran, the socket stayed up, and
+    // the credentials were never swapped.
+    expect(state.listAuth.length).toBe(0)
+    expect(MockSocket.instances.length).toBe(1)
+    expect(socket.closedWith).toBeUndefined()
+    socket.emit('close')
+    await waitFor(() => MockSocket.instances.length >= 2)
+    expect(state.tokenAuth.at(-1)).toBe(oldAuth) // the reconnect still uses the old creds
+    await rt.close()
+  })
+
+  it('restarts a consumer that had fatally stopped, using the new creds, keeping its handler', async () => {
+    MockSocket.reset()
+    const { fetchImpl, state } = credFetch()
+    state.failTokenStatus = 401 // creds ran out → first mint fails → consumer stops
+    const rt = makeCredRealtime(fetchImpl)
+    const received: string[] = []
+    rt.alarms.onCreate('*', (a) => {
+      received.push(String(a.id))
+    })
+    // The consumer attempts one mint, gets 401 (fatal), stops → client unhealthy.
+    await waitFor(() => !rt.healthy)
+    expect(MockSocket.instances.length).toBe(0)
+
+    // Fresh creds arrive.
+    state.failTokenStatus = 0
+    await rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p2' })
+    expect(rt.healthy).toBe(true)
+
+    // The stopped consumer is restarted and connects; the original handler fires.
+    const socket = await socketFor('c8yRealtimeAlarms')
+    socket.emit('message', frame('alarms', 'CREATE', '111', { id: 'aResumed' }))
+    await waitFor(() => received.length >= 1)
+    expect(received).toEqual(['aResumed'])
+    await rt.close()
+  })
+
+  it('rejects bad new creds on an unhealthy client, keeps the old ones, and can retry', async () => {
+    MockSocket.reset()
+    const { fetchImpl, state } = credFetch()
+    state.failTokenStatus = 401
+    const rt = makeCredRealtime(fetchImpl)
+    const received: string[] = []
+    rt.alarms.onCreate('*', (a) => {
+      received.push(String(a.id))
+    })
+    await waitFor(() => !rt.healthy)
+
+    // The replacement creds are also bad → validation fails → reject, restart nothing.
+    state.failListStatus = 401
+    await expect(
+      rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'bad' }),
+    ).rejects.toThrow()
+    expect(rt.healthy).toBe(false) // still unhealthy; the once-valid creds are retained
+    expect(MockSocket.instances.length).toBe(0)
+
+    // Retry with working creds → repairs.
+    state.failListStatus = 0
+    state.failTokenStatus = 0
+    await rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'good' })
+    const socket = await socketFor('c8yRealtimeAlarms')
+    socket.emit('message', frame('alarms', 'CREATE', '111', { id: 'aResumed' }))
+    await waitFor(() => received.length >= 1)
+    expect(received).toEqual(['aResumed'])
+    await rt.close()
+  })
+
+  it('does not resurrect a topic whose last handler was removed after it stopped', async () => {
+    MockSocket.reset()
+    const { fetchImpl, state } = credFetch()
+    state.failTokenStatus = 401
+    const rt = makeCredRealtime(fetchImpl)
+    const off = rt.alarms.onCreate('*', () => {})
+    await waitFor(() => !rt.healthy)
+
+    // Caller gives up on this topic: removing its last handler clears the stopped
+    // state, so the client is healthy again and there is nothing to repair.
+    off()
+    expect(rt.healthy).toBe(true)
+
+    state.failTokenStatus = 0
+    await expect(
+      rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p2' }),
+    ).rejects.toThrow(/healthy/)
+    await delay(20)
+    expect(MockSocket.instances.length).toBe(0)
+    await rt.close()
+  })
+})
