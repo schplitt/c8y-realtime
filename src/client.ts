@@ -44,7 +44,8 @@ export class NotificationClient {
   readonly #logger: Logger
   readonly #getWebSocket: () => Promise<WebSocketFactory>
   readonly #consumers = new Set<WebSocketConsumer>()
-  readonly #credentials: TenantCredentials
+  readonly #fetchImpl: typeof fetch | undefined
+  #credentials: TenantCredentials
 
   constructor(options: NotificationClientOptions) {
     this.#credentials = {
@@ -53,6 +54,7 @@ export class NotificationClient {
       user: options.user,
       password: options.password,
     }
+    this.#fetchImpl = options.fetchImpl
     this.#http = new HttpClient(this.#credentials, options.fetchImpl)
     this.subscriptions = new SubscriptionsApi(this.#http)
     this.#resilience = { ...DEFAULT_RESILIENCE, ...options.resilience }
@@ -65,6 +67,45 @@ export class NotificationClient {
    */
   get tenant(): string {
     return this.#credentials.tenant
+  }
+
+  /**
+   * Swap this client's credentials in place. Every **future** `mintToken()` and
+   * every REST call (`subscriptions.*`) uses the new credentials from here on —
+   * the underlying {@link HttpClient} is mutated, not replaced, so the
+   * `subscribe()` `mintToken` closures and the shared `subscriptions` API all
+   * pick them up on their next call. A **healthy** live consumer keeps its
+   * current socket (and its already-minted token) and only adopts the new
+   * credentials on its next natural reconnect — no forced drop, no delivery gap.
+   *
+   * Purely in-memory and side-effect free (it performs no I/O and cannot fail).
+   * Registered consumers, subscriptions and handlers are untouched. Intended for
+   * service-user credential rotation and unsubscribe→resubscribe, where the
+   * `tenant` and `baseUrl` stay the same and only the user/password change.
+   * @param credentials
+   */
+  setCredentials(credentials: TenantCredentials): void {
+    this.#credentials = {
+      baseUrl: credentials.baseUrl,
+      tenant: credentials.tenant,
+      user: credentials.user,
+      password: credentials.password,
+    }
+    this.#http.setCredentials(this.#credentials)
+  }
+
+  /**
+   * Check that a candidate set of credentials authenticates against the tenant,
+   * **without** touching this client's live credentials or connections. Runs a
+   * single read-only request (list subscriptions) through a throwaway HTTP
+   * client bound to `credentials`. Resolves if they work; **throws** (e.g.
+   * {@link C8yHttpError} 401/403) if they do not. Use this to validate before
+   * committing with {@link setCredentials}.
+   * @param credentials
+   */
+  async verifyCredentials(credentials: TenantCredentials): Promise<void> {
+    const probe = new SubscriptionsApi(new HttpClient(credentials, this.#fetchImpl))
+    await probe.list({ pageSize: 1 })
   }
 
   /**

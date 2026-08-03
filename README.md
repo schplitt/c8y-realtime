@@ -121,6 +121,26 @@ rt.hookKeys() // → ['alarms:create:12345', …]
 
 `rt.start()` connects, `rt.close()` disconnects, `rt.subscriptions` is the REST API below.
 
+### Replacing credentials after they run out
+
+When a consumer's credentials run out (rotation) or are revoked (unsubscribe→resubscribe), it hits a fatal error and stops — `rt.healthy` flips to `false`. At that point `await rt.updateCredentials(creds)` gives the client fresh credentials **without losing handlers or remote subscriptions**: it validates the new creds, swaps the credential source, and reconnects only the stopped consumers. The `tenant` and `baseUrl` must stay the same — only the user/password may change.
+
+This is repair-on-break, not proactive rotation. You may only call it while unhealthy:
+
+- **`rt.healthy === true`** → `updateCredentials` **rejects and changes nothing**. A live client's sockets still hold valid tokens; there's nothing to repair, and swapping under them isn't allowed.
+- **New creds don't authenticate** → **rejects and keeps the old creds** (they were valid at some point); the client stays unhealthy so you can retry with the next set.
+
+```ts
+if (!rt.healthy) {
+  try {
+    await rt.updateCredentials({ baseUrl, tenant, user, password: fresh })
+    // repaired: stopped consumers reconnected, handlers intact
+  } catch {
+    // still healthy, or the new creds didn't authenticate — retry later
+  }
+}
+```
+
 ## Subscription lifecycle
 
 One subscription exists per `(type, device)` for as long as it has at least one handler. When the last handler for a device is removed:

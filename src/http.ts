@@ -60,8 +60,8 @@ export function toWebSocketUrl(baseUrl: string, path: string): string {
  * Internal REST client bound to a single tenant's credentials.
  */
 export class HttpClient {
-  readonly #authHeader: string
-  readonly #baseUrl: string
+  #authHeader: string
+  #baseUrl: string
   readonly #fetch: typeof fetch
 
   constructor(credentials: TenantCredentials, fetchImpl: typeof fetch = fetch) {
@@ -72,6 +72,18 @@ export class HttpClient {
 
   get baseUrl(): string {
     return this.#baseUrl
+  }
+
+  /**
+   * Swap the credentials this client authenticates with, in place. Every holder
+   * of this instance (the {@link SubscriptionsApi} and any `mintToken` closure
+   * that reads it) picks up the new auth on its next call — no reconnect, no
+   * new instance. Used by credential rotation / unsubscribe→resubscribe.
+   * @param credentials
+   */
+  setCredentials(credentials: TenantCredentials): void {
+    this.#baseUrl = normalizeBaseUrl(credentials.baseUrl)
+    this.#authHeader = basicAuthHeader(credentials.tenant, credentials.user, credentials.password)
   }
 
   /**
