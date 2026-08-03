@@ -1,6 +1,6 @@
 {
   "name": "c8y-realtime",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "packageManager": "pnpm@11.0.9",
   "description": "A Web API compatible real-time client for Cumulocity IoT with hook-based event subscriptions",
