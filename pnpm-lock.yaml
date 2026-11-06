@@ -18,9 +18,6 @@ catalogs:
     eslint:
       specifier: ^10.3.0
       version: 10.3.0
-    hookable:
-      specifier: ^6.1.1
-      version: 6.1.1
     tsdown:
       specifier: ^0.22.0
       version: 0.22.0
@@ -34,10 +31,6 @@ catalogs:
 importers:
 
   .:
-    dependencies:
-      hookable:
-        specifier: 'catalog:'
-        version: 6.1.1
     devDependencies:
       '@schplitt/eslint-config':
         specifier: 'catalog:'

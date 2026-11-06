@@ -49,7 +49,6 @@
     "test:e2e": "vitest run tests/e2e"
   },
   "dependencies": {
-    "hookable": "catalog:"
   },
   "devDependencies": {
     "@schplitt/eslint-config": "catalog:",
