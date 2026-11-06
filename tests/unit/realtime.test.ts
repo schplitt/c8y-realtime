@@ -690,7 +690,7 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
     await rt.close()
   })
 
-  it('removes a single handler by unique label; reports found + subscriptionDeleted', () => {
+  it('removes a single handler by unique label; reports removed + subscriptionDeleted', () => {
     MockSocket.reset()
     const { rt } = lifecycleClient()
     rt.alarms.onCreate('111', () => {}, 'featureA')
@@ -733,13 +733,13 @@ describe('realtimeClient — acknowledgement', () => {
   it('does not auto-ack when autoAck is false', async () => {
     MockSocket.reset()
     const rt = makeRealtime({ autoAck: false })
-    let acked = false
+    let handled = false
     rt.alarms.onCreate('*', () => {
-      acked = true
+      handled = true
     })
     const socket = await socketFor('c8yRealtimeAlarms')
     socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'a1' }))
-    await waitFor(() => acked)
+    await waitFor(() => handled)
     await delay(20)
     expect(socket.sent).toEqual([])
     await rt.close()
@@ -943,6 +943,40 @@ describe('realtimeClient — type filters (one topic per filter group)', () => {
     await rt.close()
   })
 
+  it('the topic name is a stable function of the type set (a hash change would silently create new topics)', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoStart: false })
+    rt.alarms.onCreate({ source: '*', type: ['c8y_A', 'c8y_B'] }, () => {})
+    await rt.start()
+    // FNV-1a 64 of "c8y_A|c8y_B", base36. Pinned on purpose: existing deployments
+    // reuse this name across runs, so it must never drift.
+    expect(posted[0]!.subscription).toBe('c8yRealtimeAlarmsFfqww3fy4jkgq')
+    await rt.close()
+  })
+
+  it('a filtered per-type onAny and a filtered device scope route on the group topic; detach keeps the group', async () => {
+    MockSocket.reset()
+    const { rt, posted, deleted } = filterClient()
+    const seen: string[] = []
+    rt.alarms.onAny({ source: '7', type: 'c8y_A' }, (p, n) => {
+      seen.push(`${n.action}:${String((p as { id: string }).id)}`)
+    })
+    await rt.start()
+    expect(posted[0]!.context).toBe('mo')
+    expect(posted[0]!.subscriptionFilter?.typeFilter).toBe('\'c8y_A\'')
+    const socket = await socketFor(posted[0]!.subscription)
+    socket.emit('message', frame('alarms', 'CREATE', '7', { id: 'c', type: 'c8y_A', source: { id: '7' } }))
+    socket.emit('message', frame('alarms', 'DELETE', '7', { id: 'd' }))
+    await waitFor(() => seen.length >= 2)
+    expect(seen).toEqual(['CREATE:c', 'DELETE:d'])
+    // detach on a filtered key: handlers gone, remote kept
+    rt.alarms.onCreate({ source: '7', type: 'c8y_A' }, () => {})
+    expect(rt.detach('alarms:create:7:c8y_A')).toMatchObject({ removed: true, count: 1, subscriptionDeleted: false })
+    await delay(10)
+    expect(deleted).toEqual([])
+    await rt.close()
+  })
+
   it('a single type is sent quoted; an inner quote is doubled (OData escaping)', async () => {
     MockSocket.reset()
     const { rt, posted } = filterClient({ autoStart: false })
@@ -1084,10 +1118,12 @@ describe('realtimeClient — type filters (one topic per filter group)', () => {
     expect(() => ops.onCreate({ source: '*', type: 'x' }, fn)).toThrow(/not supported for operations/)
     // (cast the key to an allowed literal so the compile-time rejection is bypassed; runtime still sees the real string)
     expect(() => rt.hook('operations:create:*:x' as 'operations:create:*', fn)).toThrow(/not supported for operations/)
-    expect(() => rt.alarms.onCreate({ source: '*', type: [] }, fn)).toThrow(/at least one/)
-    expect(() => rt.alarms.onCreate({ source: '*', type: '' }, fn)).toThrow(/at least one/)
-    expect(() => rt.hook('alarms:create:*:' as 'alarms:create:*', fn)).toThrow(/at least one/)
-    expect(() => rt.hook('alarms:create:*:a||b' as 'alarms:create:*', fn)).toThrow(/at least one/)
+    expect(() => rt.alarms.onCreate({ source: '*', type: [] }, fn)).toThrow(/invalid type filter \[\]/)
+    expect(() => rt.alarms.onCreate({ source: '*', type: '' }, fn)).toThrow(/invalid type filter ""/)
+    expect(() => rt.hook('alarms:create:*:' as 'alarms:create:*', fn)).toThrow(/invalid type filter/)
+    expect(() => rt.hook('alarms:create:*:a||b' as 'alarms:create:*', fn)).toThrow(/doubled "\|"/)
+    expect(() => (rt.alarms.onCreate as (a: unknown, b: unknown) => void)({ source: 7, type: 'x' }, fn)).toThrow(/must be a string/)
+    expect(() => (rt.alarms.onCreate as (a: unknown, b?: unknown) => void)('*')).toThrow(/handler is missing/)
     // query/remove methods never throw: a malformed key is simply "no such key"
     expect(rt.hasHook('alarms:create:*:')).toBe(false)
     expect(rt.unsubscribe('alarms:create:*:a||b')).toEqual({ removed: false, count: 0, subscriptionDeleted: false })

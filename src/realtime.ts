@@ -4,8 +4,9 @@
  * ({@link createNotificationClient}) and powered by `hookable`.
  *
  * Two registration surfaces, both fully typed and both taking an **explicit
- * scope + a handler** (+ an optional unique label) — no options object. The
- * scope is always required: pass `'*'` for all devices or a source id for one.
+ * scope + a handler** (+ an optional unique label). The scope is always
+ * required: `'*'` for all devices, a source id for one, or `{ source, type }`
+ * to add a type filter (see below).
  *
  * - Fluent namespaces:   `rt.alarms.onCreate('*', (alarm) => …)` / `rt.alarms.onCreate('12345', (alarm) => …)`
  * - Hookable-style keys: `rt.hook('alarms:create:*', (alarm) => …)`
@@ -131,7 +132,7 @@ export interface UnhookResult {
  * `'*'` (all devices) or a specific source id. `(string & {})` keeps the `'*'`
  * literal visible for autocomplete while still accepting any id string.
  */
-type SourceScope = '*' | (string & {})
+export type SourceScope = '*' | (string & {})
 
 /**
  * A scope narrowed by message `type` (Notification 2.0 `typeFilter`). `source`
@@ -146,6 +147,7 @@ export interface FilteredScope<S extends string = SourceScope, T extends string 
 
 /**
  * The literal `type` a payload type carries, or `string` when unconstrained.
+ * Exported for people writing typed wrappers around the filtered registers.
  */
 export type PayloadType<P> = P extends { type: infer T } ? (T extends string ? T : string) : string
 
@@ -204,8 +206,9 @@ export type AnyRegister<P> = ScopedRegister<P, SourceScope>
 /**
  * Alarm / event / operation namespace — every action supports all or a device.
  * This is the plain (string-scope) shape; `alarms` and `events` expose the
- * {@link FilterableTypeHooks} subtype, which adds type filters on `onCreate` /
- * `onUpdate`. `operations` stays plain (no `type` field).
+ * {@link FilterableTypeHooks} subtype, which adds type filters (with payload
+ * narrowing on `onCreate` / `onUpdate`, filter-only on `onDelete` / `onAny`).
+ * `operations` stays plain (no `type` field).
  */
 export interface TypeHooks<P> {
   /**
@@ -232,7 +235,7 @@ export interface TypeHooks<P> {
  * carries no `type` to narrow. The platform still filters server-side: a
  * filtered `onDelete` only sees deletes of matching types.
  */
-export interface FilteredRegister<P, S extends string> extends ScopedRegister<P, S> {
+export interface FilterOnlyRegister<P, S extends string> extends ScopedRegister<P, S> {
   (scope: FilteredScope<S>, handler: NotificationHandler<P>, label?: string): Unsubscribe
 }
 
@@ -245,8 +248,8 @@ export interface FilteredRegister<P, S extends string> extends ScopedRegister<P,
 export interface FilterableTypeHooks<P> extends TypeHooks<P> {
   onCreate: FilterableRegister<P, SourceScope>
   onUpdate: FilterableRegister<P, SourceScope>
-  onDelete: FilteredRegister<DeletionPayload, SourceScope>
-  onAny: FilteredRegister<P | DeletionPayload, SourceScope>
+  onDelete: FilterOnlyRegister<DeletionPayload, SourceScope>
+  onAny: FilterOnlyRegister<P | DeletionPayload, SourceScope>
 }
 
 /**
@@ -255,8 +258,8 @@ export interface FilterableTypeHooks<P> extends TypeHooks<P> {
 export interface MeasurementHooks {
   onCreate: FilterableRegister<Measurement, string>
   onUpdate: FilterableRegister<Measurement, string>
-  onDelete: FilteredRegister<DeletionPayload, string>
-  onAny: FilteredRegister<Measurement | DeletionPayload, string>
+  onDelete: FilterOnlyRegister<DeletionPayload, string>
+  onAny: FilterOnlyRegister<Measurement | DeletionPayload, string>
 }
 
 /**
@@ -266,7 +269,7 @@ export interface MeasurementHooks {
 export interface ManagedObjectHooks {
   onCreate: FilterableRegister<ManagedObject, '*'>
   onUpdate: FilterableRegister<ManagedObject, string>
-  onDelete: FilteredRegister<DeletionPayload, string>
+  onDelete: FilterOnlyRegister<DeletionPayload, string>
 }
 
 /**
@@ -280,7 +283,7 @@ type DualScopeType = 'alarms' | 'events' | 'operations'
  * managed-object `update`/`delete` it must be a device id (no tenant-wide feed);
  * for managed-object `create` it must be `'*'` (all-devices only).
  *
- * A `create` / `update` key may carry a type filter as a **4th segment**,
+ * A `create` / `update` / `delete` key may carry a type filter as a **4th segment**,
  * several types separated by `|`: `'alarms:create:*:c8y_TemperatureAlarm'`,
  * `'events:create:145075:c8y_A|c8y_B'`. Everything after the third `:` is the
  * filter, so a type containing `:` needs no escaping; a literal `|` is written
@@ -329,11 +332,12 @@ type KeyTypeFilter<S extends string>
     : never
 
 /**
- * Keys whose filter segment is invalid, mapped to `never`: a filter on
- * `operations` (no `type`), and an empty type in the segment (`'…:*:'`,
- * `'…:a||b'`, `'…:|a'`, `'…:a|'`).
+ * Validates a hook key's filter segment at the type level: the key itself when
+ * valid, `never` for a filter on `operations` (no `type`) or an empty type in
+ * the segment (`'…:*:'`, `'…:a||b'`, `'…:|a'`, `'…:a|'`). Exported for people
+ * writing typed wrappers around {@link RealtimeClient.hook}.
  */
-export type FilterableKey<K extends string>
+export type ValidHookKey<K extends string>
   = K extends
   | `operations:${string}:${string}:${string}`
   | `${string}:${string}:${string}:`
@@ -390,7 +394,8 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
   /**
    * **Required.** Base name (alphanumeric) for this client's per-type topics and
    * consumers, yielding topics like `<name>Alarms`, `<name>Measurements`, and
-   * `<name>All` (for `onAny`).
+   * `<name>All` (for `onAny`), and `<name>AlarmsF<hash>` for a type-filtered
+   * registration (one per distinct type set).
    *
    * Give **each distinct application a unique name**. The name identifies the
    * shared topic and consumer on the platform, so two independently-deployed
@@ -527,7 +532,8 @@ interface HandlerEntry {
  * The high-level realtime client. Prefer {@link createRealtimeClient} to
  * construct one.
  *
- * One topic + one consumer **per notification type** (plus one for `onAny`).
+ * One topic + one consumer **per notification type** (plus one for `onAny`, and
+ * one per distinct type-filter set, see the module docs).
  * Each `(type, scope)` you register is its own single-type subscription — never
  * merged and never re-created — funneling into that type's topic; all
  * subscriptions of a type share one consumer, and notifications are routed to
@@ -635,13 +641,13 @@ export class RealtimeClient {
     this.measurements = {
       onCreate: this.#reg<Measurement, FilterableRegister<Measurement, string>>('measurements', 'create'),
       onUpdate: this.#reg<Measurement, FilterableRegister<Measurement, string>>('measurements', 'update'),
-      onDelete: this.#reg<DeletionPayload, FilteredRegister<DeletionPayload, string>>('measurements', 'delete'),
-      onAny: this.#reg<Measurement | DeletionPayload, FilteredRegister<Measurement | DeletionPayload, string>>('measurements', WILDCARD),
+      onDelete: this.#reg<DeletionPayload, FilterOnlyRegister<DeletionPayload, string>>('measurements', 'delete'),
+      onAny: this.#reg<Measurement | DeletionPayload, FilterOnlyRegister<Measurement | DeletionPayload, string>>('measurements', WILDCARD),
     }
     this.managedObjects = {
       onCreate: this.#reg<ManagedObject, FilterableRegister<ManagedObject, '*'>>('managedobjects', 'create'),
       onUpdate: this.#reg<ManagedObject, FilterableRegister<ManagedObject, string>>('managedobjects', 'update'),
-      onDelete: this.#reg<DeletionPayload, FilteredRegister<DeletionPayload, string>>('managedobjects', 'delete'),
+      onDelete: this.#reg<DeletionPayload, FilterOnlyRegister<DeletionPayload, string>>('managedobjects', 'delete'),
     }
   }
 
@@ -683,10 +689,10 @@ export class RealtimeClient {
    */
   hook<K extends RealtimeHookKey, Q extends HookKeyConstraint<K> = HookKeyConstraint<K>>(
     key: K,
-    // The operations/delete-with-filter rejection lives on the handler type (not
-    // `key: K & FilterableKey<K>`): an intersection on `key` breaks inference of
-    // K for template-literal keys such as `alarms:create:${scope}`.
-    handler: [FilterableKey<K>] extends [never] ? never : NotificationHandler<HookKeyPayload<K> & Q>,
+    // Invalid-filter keys (operations, empty segment) are rejected on the handler
+    // type, not via `key: K & ValidHookKey<K>`: an intersection on `key` breaks
+    // inference of K for template-literal keys such as `alarms:create:${scope}`.
+    handler: [ValidHookKey<K>] extends [never] ? never : NotificationHandler<HookKeyPayload<K> & Q>,
     label?: string,
   ): Unsubscribe {
     const h = handler as unknown as NotificationHandler<unknown>
@@ -722,7 +728,7 @@ export class RealtimeClient {
     const handler = typeof a === 'function' ? a : b
     const label = typeof a === 'function' ? (typeof b === 'string' ? b : undefined) : c
     if (typeof handler !== 'function')
-      throw new TypeError('A notification handler function is required')
+      throw new TypeError('realtime: onAny needs a handler function (optionally preceded by a source id)')
     return this.#register(scope, WILDCARD, WILDCARD, handler, label)
   }
 
@@ -925,8 +931,8 @@ export class RealtimeClient {
     return {
       onCreate: this.#reg<P, FilterableRegister<P, SourceScope>>(type, 'create'),
       onUpdate: this.#reg<P, FilterableRegister<P, SourceScope>>(type, 'update'),
-      onDelete: this.#reg<DeletionPayload, FilteredRegister<DeletionPayload, SourceScope>>(type, 'delete'),
-      onAny: this.#reg<P | DeletionPayload, FilteredRegister<P | DeletionPayload, SourceScope>>(type, WILDCARD),
+      onDelete: this.#reg<DeletionPayload, FilterOnlyRegister<DeletionPayload, SourceScope>>(type, 'delete'),
+      onAny: this.#reg<P | DeletionPayload, FilterOnlyRegister<P | DeletionPayload, SourceScope>>(type, WILDCARD),
     }
   }
 
@@ -1404,8 +1410,11 @@ function toHookKey(key: string): string {
  */
 function canonicalTypes(input: string | readonly string[]): readonly string[] {
   const list = typeof input === 'string' ? [input] : [...input]
-  if (list.length === 0 || list.some((t) => typeof t !== 'string' || t.length === 0))
-    throw new TypeError('realtime: a type filter needs at least one non-empty type string')
+  if (list.length === 0 || list.some((t) => typeof t !== 'string' || t.length === 0)) {
+    throw new TypeError(
+      `realtime: invalid type filter ${JSON.stringify(input)} — needs at least one type, and every type must be a non-empty string (in a key, check for a trailing or doubled "|")`,
+    )
+  }
   return [...new Set(list)].sort()
 }
 
@@ -1476,18 +1485,19 @@ function parseScopeArgs(
   b: NotificationHandler<unknown> | undefined,
   c: string | undefined,
 ): { scope: string, handler: NotificationHandler<unknown>, label: string | undefined, types: readonly string[] | undefined } {
+  const usage = 'realtime: a register takes (scope, handler, label?) — scope is "*" (all devices), a device id, or { source, type }'
   if (typeof b !== 'function')
-    throw new TypeError('A source scope ("*" for all devices, or a device id) and a handler function are required')
+    throw new TypeError(`${usage}; the handler is missing or not a function`)
   const label = typeof c === 'string' ? c : undefined
   if (typeof a === 'string')
     return { scope: a.length > 0 ? a : WILDCARD, handler: b, label, types: undefined }
   if (a && typeof a === 'object' && typeof (a as { source?: unknown }).source === 'string') {
     const { source, type } = a as { source: string, type?: unknown }
     if (typeof type !== 'string' && !Array.isArray(type))
-      throw new TypeError('A filtered scope needs a `type` (one type string, or a list of them)')
+      throw new TypeError(`${usage}; { source, type } needs a \`type\` (one type string, or a list of them)`)
     return { scope: source.length > 0 ? source : WILDCARD, handler: b, label, types: canonicalTypes(type as string | string[]) }
   }
-  throw new TypeError('A source scope ("*" for all devices, a device id, or { source, type }) and a handler function are required')
+  throw new TypeError(`${usage}; got scope ${JSON.stringify(a)} (a { source } must be a string)`)
 }
 
 /**
