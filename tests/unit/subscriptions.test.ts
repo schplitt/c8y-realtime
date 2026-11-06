@@ -61,6 +61,23 @@ describe('subscriptionsApi.ensure', () => {
   })
 })
 
+describe('subscriptionsApi.ensureDetailed', () => {
+  it('reports created: true for a fresh create and created: false after a 409', async () => {
+    let conflict = false
+    const { api } = makeApi((method) => {
+      if (method === 'POST')
+        return conflict ? jsonResponse({}, 409) : jsonResponse({ id: '1', context: 'tenant', subscription: 'demo' }, 201)
+      return jsonResponse({ subscriptions: [{ id: '1', context: 'tenant', subscription: 'demo' }] })
+    })
+    const first = await api.ensureDetailed({ context: 'tenant', subscription: 'demo' })
+    expect(first).toEqual({ created: true, subscription: { id: '1', context: 'tenant', subscription: 'demo' } })
+    conflict = true
+    const second = await api.ensureDetailed({ context: 'tenant', subscription: 'demo' })
+    expect(second.created).toBe(false)
+    expect(second.subscription.id).toBe('1')
+  })
+})
+
 describe('subscriptionsApi.delete', () => {
   it('treats 404 as already-deleted success', async () => {
     const { api } = makeApi(() => new Response('', { status: 404 }))

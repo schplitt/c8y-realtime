@@ -13,6 +13,21 @@ import type {
 } from './types'
 
 const SUBSCRIPTIONS_PATH = 'notification2/subscriptions'
+
+/**
+ * Result of {@link SubscriptionsApi.ensureDetailed}.
+ */
+export interface EnsureResult {
+  /**
+   * `true` if this call created the subscription; `false` if it already
+   * existed (HTTP 409) and the existing resource was returned instead. Note
+   * that after a 409 with no exact `(name, source)` match in the listing, the
+   * first subscription of that name is returned, so `subscription` may have a
+   * different source than requested.
+   */
+  created: boolean
+  subscription: SubscriptionResponse
+}
 const TOKEN_PATH = 'notification2/token'
 const UNSUBSCRIBE_PATH = 'notification2/unsubscribe'
 
@@ -71,16 +86,27 @@ export class SubscriptionsApi {
    * Ensure a subscription exists. Mirrors the reference implementation's
    * controller-helper: a create that returns HTTP 409 (conflict / already
    * exists) is treated as success, and the existing subscription is returned.
+   * Use {@link ensureDetailed} to learn whether it was created or adopted.
    * @param subscription
    */
   async ensure(subscription: Subscription): Promise<SubscriptionResponse> {
+    return (await this.ensureDetailed(subscription)).subscription
+  }
+
+  /**
+   * {@link ensure}, also reporting whether this call **created** the
+   * subscription (`created: true`) or found an existing one after a 409
+   * (`created: false`) — so a caller can tell what it owns.
+   * @param subscription
+   */
+  async ensureDetailed(subscription: Subscription): Promise<EnsureResult> {
     const { status, data } = await this.#http.request<SubscriptionResponse>('POST', SUBSCRIPTIONS_PATH, {
       body: subscription,
       allowStatuses: [409],
     })
 
     if (status !== 409 && data)
-      return data
+      return { created: true, subscription: data }
 
     // Already exists: look it up so the caller still gets a concrete resource.
     const existing = await this.list({
@@ -94,11 +120,11 @@ export class SubscriptionsApi {
     ) ?? existing.subscriptions[0]
 
     if (match)
-      return match
+      return { created: false, subscription: match }
 
     // 409 without a discoverable existing resource: surface it honestly.
     if (data)
-      return data
+      return { created: false, subscription: data }
     throw new C8yHttpError({
       status: 409,
       statusText: 'Conflict',
