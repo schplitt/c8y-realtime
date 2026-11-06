@@ -410,6 +410,18 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
   subscription?: RealtimeSubscriptionOptions
   /**
    * Acknowledge each notification after all handlers resolve. Defaults to `true`.
+   *
+   * Frames the client drops on its own — duplicates of an acked frame, frames
+   * with no handler, and out-of-filter frames on a filter-group topic — are
+   * **always** acked, whatever this is set to: they are never handed to a
+   * handler, so nobody else could ack them and they would otherwise be
+   * redelivered on every reconnect.
+   *
+   * With `autoAck: false`, a frame you have **not** acked is never treated as
+   * a duplicate: when the platform redelivers it (reconnect), your handlers run
+   * again — at-least-once, as intended. The flip side is that overlapping
+   * subscriptions (tenant + device on one topic) can deliver the same message
+   * twice until you ack it.
    */
   autoAck?: boolean
   /**
@@ -432,9 +444,11 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
    * delete that scope's remote subscription and — once a whole type has no scopes
    * left — close its consumer. Defaults to `true`.
    *
-   * Set `false` to keep subscriptions durable (they survive having no handlers,
-   * so re-registering resumes without a re-create and no persistent backlog is
-   * lost). {@link RealtimeClient.unsubscribe} always deletes regardless; {@link
+   * Set `false` to keep subscriptions durable: they survive having no handlers,
+   * so re-registering resumes without a re-create. The topic's connection is
+   * still closed once nobody listens, so a persistent backlog accumulates
+   * server-side meanwhile and is drained on resume. {@link
+   * RealtimeClient.unsubscribe} always deletes regardless; {@link
    * RealtimeClient.detach} always keeps regardless.
    */
   deleteSubscriptionOnEmpty?: boolean
@@ -611,7 +625,9 @@ export class RealtimeClient {
 
   // Per-topic bounded duplicate suppression (must be per-topic: the same event
   // legitimately arrives on both its type topic and the onAny topic).
-  readonly #dedup = new Map<string, { seen: Set<string>, order: string[] }>()
+  // Each entry remembers whether that frame was acked (by autoAck or by the user)
+  // so a manual-ack redelivery of an unacked frame is delivered again, not dropped.
+  readonly #dedup = new Map<string, { seen: Map<string, { acked: boolean }>, order: string[] }>()
 
   #closing = false
 
@@ -764,11 +780,14 @@ export class RealtimeClient {
    * subscription and its consumer alive (regardless of `deleteSubscriptionOnEmpty`),
    * so re-registering later resumes without re-creating the subscription.
    *
-   * ⚠️ Use only when you intend to resume. A persistent subscription left with no
-   * handlers still counts against your subscription quota, keeps being delivered
-   * (and, with `autoAck`, dropped) — and if you disabled `autoAck`, its backlog
-   * grows unacknowledged until TTL/quota. If you do **not** intend to resume, use
-   * {@link unsubscribe} instead so nothing is left dangling.
+   * Once the topic has no handler left at all, its connection is closed, so a
+   * **persistent** subscription's backlog accumulates server-side and is drained
+   * when you re-register (nothing in between is lost, within the platform's
+   * TTL/quota); a non-persistent one simply loses what happens in between.
+   *
+   * ⚠️ Use only when you intend to resume: a kept subscription still counts
+   * against your quota and its backlog keeps growing. If you do **not** intend
+   * to resume, use {@link unsubscribe} instead so nothing is left dangling.
    *
    * @param key
    * @returns `{ removed, count }` — same shape as {@link unsubscribe}.
@@ -829,11 +848,12 @@ export class RealtimeClient {
   }
 
   /**
-   * Ensure every registered subscription exists and every type's consumer is
-   * connected. Idempotent; called automatically as handlers are registered
-   * unless `autoStart` is `false`.
+   * Ensure every registered subscription exists (retrying any whose create
+   * failed earlier) and every type's consumer is connected. Idempotent; called
+   * automatically as handlers are registered unless `autoStart` is `false`.
    */
   async start(): Promise<void> {
+    this.#ensureAllSubs()
     await Promise.all([...this.#subs.values()])
     for (const topicKey of this.#topicKeys)
       this.#ensureTopicConsumer(topicKey)
@@ -872,9 +892,11 @@ export class RealtimeClient {
    *   point), the client stays unhealthy, and the caller can retry with the next
    *   set of credentials.
    * - **They authenticate** → swap the credential source (every future token
-   *   mint and REST call uses them), then restart exactly the stopped consumers,
-   *   reusing their remote subscriptions. Any still-healthy consumer keeps its
-   *   socket and migrates on its own next natural reconnect — no forced drop.
+   *   mint and REST call uses them), re-create any subscription whose create had
+   *   failed under the old credentials, then restart exactly the stopped
+   *   consumers, reusing their remote subscriptions. Any still-healthy consumer
+   *   keeps its socket and migrates on its own next natural reconnect — no
+   *   forced drop.
    *
    * @param credentials - The replacement tenant credentials.
    * @throws if the client is still {@link healthy}, or if the new credentials do
@@ -895,6 +917,10 @@ export class RealtimeClient {
 
     // Validated — swap the source in memory. Any still-healthy socket keeps running.
     this.#client.setCredentials(credentials)
+
+    // Re-create any subscription whose ensure failed under the old credentials
+    // (its registration is still wanted, it just has no remote resource yet).
+    this.#ensureAllSubs()
 
     // Restart exactly the topics whose consumer had already stopped.
     // Reuse the existing remote subscription (#subs untouched); just re-open the
@@ -1017,7 +1043,9 @@ export class RealtimeClient {
       if (this.#detachEntry(entry))
         count += 1
     }
-    const subscriptionDeleted = deleteRemote && entries[0] ? this.#teardownIfEmpty(entries[0], true) : false
+    // Always run the teardown: with deleteRemote=false it keeps the subscription
+    // but still closes the topic's connection once nobody listens.
+    const subscriptionDeleted = entries[0] ? this.#teardownIfEmpty(entries[0], deleteRemote) : false
     return { removed: count > 0, count, subscriptionDeleted }
   }
 
@@ -1046,17 +1074,22 @@ export class RealtimeClient {
   }
 
   /**
-   * If a `(type, scope)` now has no handlers and `deleteRemote` is set, delete its
-   * remote subscription and — if the type has no scopes left — close its consumer.
+   * If a `(type, scope)` now has no handlers: delete its remote subscription when
+   * `deleteRemote` is set (otherwise keep it, so a later registration resumes it
+   * without re-creating), and — once the topic has no listening scope left —
+   * close its consumer either way. Closing the consumer is what makes "keep"
+   * meaningful: with nobody listening, frames would otherwise be acked and
+   * dropped; with the consumer closed, a persistent backlog accumulates
+   * server-side and is drained on resume.
    * @param entry
    * @param deleteRemote
+   * @returns whether the remote subscription was deleted
    */
   #teardownIfEmpty(entry: HandlerEntry, deleteRemote: boolean): boolean {
-    if (!deleteRemote)
-      return false
     if ((this.#subHandlerCount.get(entry.subKey) ?? 0) > 0)
       return false // another action for this (type, scope) still has a handler
-    this.#deleteRemoteSub(entry.subKey)
+    if (deleteRemote)
+      this.#deleteRemoteSub(entry.subKey)
     const scopes = this.#typeScopes.get(entry.type)
     if (scopes) {
       scopes.delete(entry.scope)
@@ -1066,7 +1099,7 @@ export class RealtimeClient {
         this.#filterGroups.delete(entry.type)
       }
     }
-    return true
+    return deleteRemote
   }
 
   /**
@@ -1185,9 +1218,25 @@ export class RealtimeClient {
       .catch((error) => {
         if (!this.#closing)
           this.#logger.error(`realtime: failed to ensure subscription ${key}`, error)
+        // Forget the failed attempt so start() / updateCredentials() retry it
+        // (a cached failure would otherwise block every later ensure for good).
+        if (this.#subs.get(key) === promise)
+          this.#subs.delete(key)
         return undefined
       })
     this.#subs.set(key, promise)
+  }
+
+  /**
+   * (Re-)ensure a subscription for every registered `(topicKey, scope)`. A no-op
+   * for the ones that already exist or are in flight; only failed/forgotten ones
+   * are attempted again.
+   */
+  #ensureAllSubs(): void {
+    for (const [topicKey, scopes] of this.#typeScopes) {
+      for (const scope of scopes)
+        this.#ensureSub(topicKey, scope)
+    }
   }
 
   /**
@@ -1234,11 +1283,26 @@ export class RealtimeClient {
     const action = notification.action.toLowerCase()
     const source = notification.description.sourceId || WILDCARD
 
-    if (this.#dedupe && this.#isDuplicate(topicKey, type, action, source, notification.rawPayload)) {
-      if (this.#autoAck)
-        notification.ack() // clear the duplicate from the backlog, but don't re-deliver
-      return
+    let seen: { acked: boolean } | undefined
+    if (this.#dedupe) {
+      const { entry, duplicate } = this.#dedupEntry(topicKey, `${type}#${action}#${source}#${notification.rawPayload}`)
+      seen = entry
+      // A repeat of a frame that was already acked (or that autoAck will ack once
+      // its first delivery finishes) is a duplicate: drop it and ack it, so it
+      // leaves the backlog. A repeat of a frame nobody acked under manual ack is
+      // the platform redelivering it on purpose — hand it to the handlers again.
+      if (duplicate && (this.#autoAck || entry.acked)) {
+        notification.ack()
+        return
+      }
     }
+    // Route every ack (ours or the user's) through the dedupe entry.
+    const ack = (): void => {
+      if (seen)
+        seen.acked = true
+      notification.ack()
+    }
+    const delivered: Notification = seen ? { ...notification, ack } : notification
 
     // On a filter-group topic the server already filtered by `type`; guard anyway
     // so a handler typed for `c8y_X` never sees anything else.
@@ -1249,7 +1313,7 @@ export class RealtimeClient {
         // Should never fire (the server filtered already); warn so a grammar
         // mismatch is visible, and always ack — the user never sees this frame.
         this.#logger.warn(`realtime: dropped ${type}:${action} of type ${JSON.stringify(payloadType)} not in filter ${group.odata}`)
-        notification.ack()
+        ack()
         return
       }
     }
@@ -1274,14 +1338,18 @@ export class RealtimeClient {
     for (const key of keys) {
       if ((this.#hookHandlers.get(key)?.size ?? 0) > 0)
         handled = true
-      await this.#hooks.callHook(key, notification.payload, notification)
+      await this.#hooks.callHook(key, delivered.payload, delivered)
     }
 
-    if (!handled)
+    if (!handled) {
+      // Same as a duplicate: nothing was delivered, so ack unconditionally.
       this.#logger.debug(`realtime: no handler for ${type}:${action} (source ${source}) — acknowledged and dropped`)
+      ack()
+      return
+    }
 
     if (this.#autoAck)
-      notification.ack()
+      ack()
   }
 
   /**
@@ -1306,28 +1374,28 @@ export class RealtimeClient {
 
   /**
    * Per-topic duplicate detection keyed by full frame content. Identical content
-   * delivered twice on the SAME topic (reconnect) is a duplicate; genuinely
-   * distinct events differ in their payload so are never suppressed.
+   * delivered twice on the SAME topic (overlapping subscriptions, or a reconnect)
+   * is a duplicate; genuinely distinct events differ in their payload so are
+   * never suppressed. Returns the (new or existing) entry, which tracks whether
+   * the frame has been acked.
    * @param topicKey
-   * @param type
-   * @param action
-   * @param source
-   * @param rawPayload
+   * @param key
    */
-  #isDuplicate(topicKey: string, type: string, action: string, source: string, rawPayload: string): boolean {
+  #dedupEntry(topicKey: string, key: string): { entry: { acked: boolean }, duplicate: boolean } {
     let state = this.#dedup.get(topicKey)
     if (!state) {
-      state = { seen: new Set(), order: [] }
+      state = { seen: new Map(), order: [] }
       this.#dedup.set(topicKey, state)
     }
-    const key = `${type}#${action}#${source}#${rawPayload}`
-    if (state.seen.has(key))
-      return true
-    state.seen.add(key)
+    const existing = state.seen.get(key)
+    if (existing)
+      return { entry: existing, duplicate: true }
+    const entry = { acked: false }
+    state.seen.set(key, entry)
     state.order.push(key)
     if (state.order.length > DEDUPE_WINDOW)
       state.seen.delete(state.order.shift()!)
-    return false
+    return { entry, duplicate: false }
   }
 }
 

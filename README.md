@@ -120,15 +120,15 @@ Available on `alarms`, `events`, `measurements` (the measurement `type`, not the
 
 Required: `name` (unique per app, alphanumeric), plus `baseUrl`, `tenant`, `user`, `password`.
 
-| Option                       | Default | What It Does                                                         |
-| ---------------------------- | ------- | -------------------------------------------------------------------- |
-| `deleteSubscriptionOnEmpty`  | `true`  | Delete a device's remote subscription when its last handler is gone. |
-| `deleteSubscriptionsOnClose` | `false` | Delete every subscription this client created on `close()`.          |
-| `autoAck`                    | `true`  | Acknowledge each message after its handlers finish.                  |
-| `autoStart`                  | `true`  | Connect as soon as handlers are registered.                          |
-| `ensureSubscription`         | `true`  | Create the subscription on the platform if missing.                  |
-| `dedupe`                     | `true`  | Drop identical messages redelivered on the same stream.              |
-| `subscription`               | —       | `{ apis?, nonPersistent? }` (see [persistence](#persistence)).       |
+| Option                       | Default | What It Does                                                                                                                                                          |
+| ---------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deleteSubscriptionOnEmpty`  | `true`  | Delete a device's remote subscription when its last handler is gone.                                                                                                  |
+| `deleteSubscriptionsOnClose` | `false` | Delete every subscription this client created on `close()`.                                                                                                           |
+| `autoAck`                    | `true`  | Acknowledge each message after its handlers finish. Off: you call `n.ack()`. Frames the client drops itself (duplicates, no handler, out-of-filter) are always acked. |
+| `autoStart`                  | `true`  | Connect as soon as handlers are registered.                                                                                                                           |
+| `ensureSubscription`         | `true`  | Create the subscription on the platform if missing.                                                                                                                   |
+| `dedupe`                     | `true`  | Drop identical messages redelivered on the same stream.                                                                                                               |
+| `subscription`               | —       | `{ apis?, nonPersistent? }` (see [persistence](#persistence)).                                                                                                        |
 
 Also accepts `resilience`, `logger`, `webSocketImpl`, `fetchImpl`.
 
