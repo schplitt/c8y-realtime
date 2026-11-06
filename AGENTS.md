@@ -25,7 +25,7 @@ src/
 ├── subscriptions.ts  # notification2/subscriptions + /token + /unsubscribe
 ├── frame.ts          # consumer wire-protocol frame parsing + ack id
 ├── consumer.ts       # resilient WebSocketConsumer (async-iterable)
-├── client.ts         # createNotificationClient / createMultiTenantClient
+├── client.ts         # createNotificationClient
 └── realtime.ts       # createRealtimeClient (typed hooks, one topic + one consumer)
 ```
 
@@ -421,7 +421,7 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 
 ### Tools & Dependencies
 
-- The package should stay lightweight and avoid unnecessary runtime dependencies in the core realtime implementation. Runtime deps: `ws` (consumer) and `hookable` (high-level dispatch) only.
+- The package should stay lightweight and avoid unnecessary runtime dependencies in the core realtime implementation. Runtime deps: `hookable` (high-level dispatch) only; the consumer uses the runtime's global `WebSocket` (injectable).
 - CI runs build, unit tests, lint, and typecheck on pull requests; keep local verification aligned with that.
 - Release publishing is tag-driven through GitHub Actions and npm.
 
@@ -455,5 +455,5 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 
 ### Design records (`internal/`, gitignored)
 
-- `internal/decisions/NNNN-*.md` hold design decisions with context, reasoning, and open questions (e.g. why there was no server-side filtering, and the per-filter-group topic design). The directory is **gitignored (local to the maintainer's machine)**; if it is absent, the verified facts below and the module comment in `src/realtime.ts` are the record.
-- Verified platform fact (2026-11-06): subscription uniqueness is `(source, context, subscription name)`; a second create under the same name with a different `typeFilter` or `apis` returns 409. A filter therefore needs its own topic name.
+- `internal/decisions/NNNN-*.md` hold design decisions with context, reasoning, and open questions (e.g. why there was no server-side filtering, and the per-filter-group topic design). The directory is **gitignored (local to the maintainer's machine)**; if it is absent, the verified facts in "Notification 2.0 resource model & cleanup" above and the module comment in `src/realtime.ts` are the record.
+- High-level client invariants (2026-11-06): the client **always acks frames it drops itself** (duplicates of an acked frame, no handler, out-of-filter), whatever `autoAck` is; under `autoAck: false` a repeat of an **unacked** frame is a redelivery and is handed to handlers again (dedupe entries track ack state). A kept subscription (`detach`, `deleteSubscriptionOnEmpty: false`) **closes the topic connection once nobody listens** so the persistent backlog accumulates server-side. The client **never deletes a subscription it did not create** (`ensureDetailed().created`); consumer close/reopen is serialized per topic via `#pendingCloses`.
