@@ -29,7 +29,7 @@ src/
 └── realtime.ts       # createRealtimeClient (typed hooks, one topic + one consumer)
 ```
 
-Key model note (see Learnings): a Notification 2.0 **subscription** ≠ **topic** ≠ **consumer**. The high-level client uses ONE topic + ONE consumer, with per-scope subscriptions (apis narrowed to registered types) funneling in.
+Key model note (see Learnings): a Notification 2.0 **subscription** ≠ **topic** ≠ **consumer**. The high-level client uses ONE topic + ONE consumer per notification type, with per-scope subscriptions (apis narrowed to registered types) funneling in. A **type filter** (`{ source, type }` / 4th key segment `:<a>|<b>`, only `|`→`%7C` and `%`→`%25` escaped; NOT backslashes, which vanish in JS literals) is its own **filter group**: one extra topic + consumer per distinct canonical type set, named `<name><Type>F<fnv1a-base36 hash>`, each subscription carrying `typeFilter`. Internal `topicKey` is `<type>` or `<type>~<hash>`; routing is by topic. Never share a filtered sub with the unfiltered topic (platform 409 on same name).
 
 ## Key Design Constraints
 
@@ -430,6 +430,9 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 - Three distinct server-side resources: **subscription** (`notification2/subscriptions`, has an `id`, deletable), **topic** (Messaging Service, named by the `subscription` field; many subscriptions with the same name funnel into ONE topic), and **consumer/subscriber** (created on first websocket connect; persists after disconnect).
 - Deleting a subscription does NOT delete the topic or its consumers. Disconnecting a websocket does NOT remove the consumer.
 - `subscriptionFilter.apis` is a **filter** (which data categories forward), alongside `typeFilter` (content) and `fragmentsToCopy` (payload trimming) — not a "channel". Scope is `context` + `source`, separately.
+- **`typeFilter` grammar (verified live 2026-11-06):** `'a'`, `a` (unquoted single), `'a' or 'b'`, `''` for a literal quote, `:`/`#`/space inside quotes, 11 `or` terms — all accepted and stored verbatim. Matching is **exact and case-sensitive** (`c8y_probea` does not match `'c8y_ProbeA'`). **DELETE frames are filtered too** (only deletes of matching types forwarded). Operations accept a typeFilter on create (semantics untested).
+- **Event DELETE payload is NOT `{ id }`** (pre-existing platform quirk, observed 2026-11-06): the frame body is a Java `toString` like `com.cumulocity.inventorysvc.impl.SourceableRealtimeNotificationService$1@…`, which `parsePayload` passes through as a raw string. The deleted event's id is not recoverable from the frame; only the header's sourceId (the device) is.
+- **Uniqueness key is `(source, context, subscription name)` and ignores the filter** (verified live 2026-11-06): a second create under the same name with a different `typeFilter` or even different `apis` → 409. Deleting one subscription on a shared topic does NOT close the connected consumer or affect the other subscriptions on it. Overlapping subs on the SAME topic deliver one copy each (deduped client-side, per topic, when `dedupe` is on); across different topics (e.g. unfiltered + filter group) each topic's handlers get their own copy by design.
 - The old design created one topic+consumer per `(type, scope)` → a new topic every run (device ids change) → resource leak. Fixed: ONE topic + ONE consumer per client, per-scope subscriptions funneling in.
 - **Cleanup** (tests): delete subscription resources by id AND purge consumers via the admin API: `GET /service/messaging-management/tenants/{tenant}/namespaces/relnotif/topics` → `DELETE …/topics/{topic}/types/persistent/subscribers/{name}`. Topics themselves can NOT be deleted (405); they auto-GC once empty.
 
@@ -449,3 +452,8 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 - Do not assume DELETE events contain full resource payloads.
 - Do not use `pnpm test` in automation.
 - Do not forget to update `README.md` and `AGENTS.md` when public behavior or architecture changes.
+
+### Design records (`internal/`, gitignored)
+
+- `internal/decisions/NNNN-*.md` hold design decisions with context, reasoning, and open questions (e.g. why there was no server-side filtering, and the per-filter-group topic design). The directory is **gitignored (local to the maintainer's machine)**; if it is absent, the verified facts below and the module comment in `src/realtime.ts` are the record.
+- Verified platform fact (2026-11-06): subscription uniqueness is `(source, context, subscription name)`; a second create under the same name with a different `typeFilter` or `apis` returns 409. A filter therefore needs its own topic name.

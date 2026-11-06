@@ -38,15 +38,21 @@
  * consumer. Use {@link RealtimeClient.detach} to remove handlers while keeping
  * the remote subscription alive for a later resume.
  *
- * ## No server-side or client-side filtering
+ * ## Type filters: one topic per filter group
  *
- * Subscriptions always forward the **full** message for their type — there is no
- * `typeFilter` and no `fragmentsToCopy`. Cumulocity Notification 2.0 has no
- * atomic *update* on a subscription (only delete + create), so a per-scope filter
- * could only be changed by unsubscribe→resubscribe (risking lost messages) or
- * subscribe→unsubscribe (risking double delivery). Forwarding everything keeps the
- * subscription immutable and lets any number of handlers share one `(type, scope)`
- * stream without conflict. Filter/shape inside your handler if you need to.
+ * A registration may narrow by the message `type` (Notification 2.0
+ * `typeFilter`): `rt.alarms.onCreate({ source: '*', type: 'c8y_TemperatureAlarm' }, fn)`
+ * or `rt.hook('alarms:create:*:c8y_TemperatureAlarm', fn)`. The platform's
+ * subscription uniqueness key is `(source, context, subscription name)` and
+ * ignores the filter, and a subscription can never be updated in place — so a
+ * filter cannot ride on the unfiltered topic. Instead each distinct **filter
+ * group** (the canonical, sorted set of types) gets its **own topic + consumer**,
+ * named `<name><Type>F<hash>`. Inside a group everything works exactly like the
+ * unfiltered case: one immutable single-type subscription per scope (carrying
+ * `typeFilter`), routing by topic, handlers fire once by construction. An
+ * unfiltered and a filtered registration on the same scope are two independent
+ * topics; cancelling one never touches the other. The cost is one websocket per
+ * filter group. There is still no `fragmentsToCopy`.
  */
 import { createHooks } from 'hookable'
 import { createNotificationClient } from './client'
@@ -128,35 +134,78 @@ export interface UnhookResult {
 type SourceScope = '*' | (string & {})
 
 /**
+ * A scope narrowed by message `type` (Notification 2.0 `typeFilter`). `source`
+ * is the device scope exactly as in the string form (`'*'` or a source id);
+ * `type` is one type string or a list (sent as the OData `'a' or 'b'` form).
+ * Each distinct set of types is its own topic + consumer (see the module docs).
+ */
+export interface FilteredScope<S extends string = SourceScope, T extends string = string> {
+  source: S
+  type: T | readonly T[]
+}
+
+/**
+ * The literal `type` a payload type carries, or `string` when unconstrained.
+ */
+export type PayloadType<P> = P extends { type: infer T } ? (T extends string ? T : string) : string
+
+/**
+ * A register taking a plain string scope: `(scope, handler, label?)`.
+ */
+export interface ScopedRegister<P, S extends string> {
+  (scope: S, handler: NotificationHandler<P>, label?: string): Unsubscribe
+}
+
+/**
+ * A register that additionally accepts a {@link FilteredScope}. Pass your own
+ * object type (or a union) as the generic: its `type` literal(s) constrain the
+ * filter — a mismatch is a compile error — and the handler receives the base
+ * payload intersected with it:
+ *
+ * ```ts
+ * interface TempAlarm { type: 'c8y_TemperatureAlarm', c8y_Temperature: { T: { value: number } } }
+ * rt.alarms.onCreate<TempAlarm>({ source: '*', type: 'c8y_TemperatureAlarm' }, (a) => a.c8y_Temperature.T.value)
+ * rt.alarms.onCreate<TempAlarm>({ source: '*', type: 'c8y_Other' }, fn) // ✗ type error
+ * ```
+ *
+ * Without a generic the payload is the base type with `type` narrowed to the
+ * literal(s) you passed.
+ */
+export interface FilterableRegister<P, S extends string> extends ScopedRegister<P, S> {
+  <Q extends { type: string } = P & { type: string }, const T extends PayloadType<Q> = PayloadType<Q>>(
+    scope: FilteredScope<S, T>,
+    handler: NotificationHandler<P & Q & { type: T }>,
+    label?: string,
+  ): Unsubscribe
+}
+
+/**
  * Register an all-devices handler. The scope is **required** and must be the
  * literal `'*'` — this action only exists tenant-wide (e.g. managed-object
  * `create`), so there is no device-id form. An optional unique `label` lets you
  * remove this exact handler later via {@link RealtimeClient.unhook}.
  */
-export interface AllRegister<P> {
-  (scope: '*', handler: NotificationHandler<P>, label?: string): Unsubscribe
-}
+export type AllRegister<P> = ScopedRegister<P, '*'>
 
 /**
  * Register a device-scoped handler — the source id is **required** (this type has
  * no tenant-wide feed, e.g. `measurements` or managed-object `update`/`delete`).
  * An optional unique `label` enables {@link RealtimeClient.unhook}.
  */
-export interface IdRegister<P> {
-  (sourceId: string, handler: NotificationHandler<P>, label?: string): Unsubscribe
-}
+export type IdRegister<P> = ScopedRegister<P, string>
 
 /**
  * Register a handler for all devices (`'*'`) or one source id — the scope is
  * **required** as the first argument. An optional unique `label` enables
  * {@link RealtimeClient.unhook}.
  */
-export interface AnyRegister<P> {
-  (scope: SourceScope, handler: NotificationHandler<P>, label?: string): Unsubscribe
-}
+export type AnyRegister<P> = ScopedRegister<P, SourceScope>
 
 /**
  * Alarm / event / operation namespace — every action supports all or a device.
+ * This is the plain (string-scope) shape; `alarms` and `events` expose the
+ * {@link FilterableTypeHooks} subtype, which adds type filters on `onCreate` /
+ * `onUpdate`. `operations` stays plain (no `type` field).
  */
 export interface TypeHooks<P> {
   /**
@@ -178,13 +227,36 @@ export interface TypeHooks<P> {
 }
 
 /**
+ * A register that accepts a {@link FilteredScope} **without** payload
+ * narrowing — for `onDelete` / `onAny`, where the payload (a DELETE's `{ id }`)
+ * carries no `type` to narrow. The platform still filters server-side: a
+ * filtered `onDelete` only sees deletes of matching types.
+ */
+export interface FilteredRegister<P, S extends string> extends ScopedRegister<P, S> {
+  (scope: FilteredScope<S>, handler: NotificationHandler<P>, label?: string): Unsubscribe
+}
+
+/**
+ * {@link TypeHooks} whose registers also take a {@link FilteredScope} (type
+ * filter): `onCreate` / `onUpdate` with payload narrowing, `onDelete` / `onAny`
+ * without. Assignable to `TypeHooks<P>`, so generic code written against that
+ * keeps working.
+ */
+export interface FilterableTypeHooks<P> extends TypeHooks<P> {
+  onCreate: FilterableRegister<P, SourceScope>
+  onUpdate: FilterableRegister<P, SourceScope>
+  onDelete: FilteredRegister<DeletionPayload, SourceScope>
+  onAny: FilteredRegister<P | DeletionPayload, SourceScope>
+}
+
+/**
  * Measurement namespace — device-scoped only (no tenant-wide measurement feed).
  */
 export interface MeasurementHooks {
-  onCreate: IdRegister<Measurement>
-  onUpdate: IdRegister<Measurement>
-  onDelete: IdRegister<DeletionPayload>
-  onAny: IdRegister<Measurement | DeletionPayload>
+  onCreate: FilterableRegister<Measurement, string>
+  onUpdate: FilterableRegister<Measurement, string>
+  onDelete: FilteredRegister<DeletionPayload, string>
+  onAny: FilteredRegister<Measurement | DeletionPayload, string>
 }
 
 /**
@@ -192,9 +264,9 @@ export interface MeasurementHooks {
  * yet); UPDATE and DELETE are device-scoped only (no tenant-wide feed).
  */
 export interface ManagedObjectHooks {
-  onCreate: AllRegister<ManagedObject>
-  onUpdate: IdRegister<ManagedObject>
-  onDelete: IdRegister<DeletionPayload>
+  onCreate: FilterableRegister<ManagedObject, '*'>
+  onUpdate: FilterableRegister<ManagedObject, string>
+  onDelete: FilteredRegister<DeletionPayload, string>
 }
 
 /**
@@ -208,17 +280,28 @@ type DualScopeType = 'alarms' | 'events' | 'operations'
  * managed-object `update`/`delete` it must be a device id (no tenant-wide feed);
  * for managed-object `create` it must be `'*'` (all-devices only).
  *
+ * A `create` / `update` key may carry a type filter as a **4th segment**,
+ * several types separated by `|`: `'alarms:create:*:c8y_TemperatureAlarm'`,
+ * `'events:create:145075:c8y_A|c8y_B'`. Everything after the third `:` is the
+ * filter, so a type containing `:` needs no escaping; a literal `|` is written
+ * `%7C` and a literal `%` is `%25` (nothing else is ever encoded — and unlike a
+ * backslash, `%` survives a JS string literal untouched). Not valid on
+ * `operations` (no `type`). On a `delete` key the platform still filters, but
+ * the payload is not narrowed (a DELETE payload carries no `type`).
+ *
  * The lone key `'*'` is the `onAny` firehose (every type, every action, all
  * devices) — the key form of {@link RealtimeClient.onAny}.
  *
  * @example `'*'`, `'alarms:create:*'`, `'alarms:create:145075'`,
- * `'measurements:create:145075'`, `'managedobjects:update:145075'`
+ * `'measurements:create:145075'`, `'managedobjects:update:145075'`,
+ * `'alarms:create:*:c8y_TemperatureAlarm'`, `'events:create:*:c8y_A|c8y_B'`
  */
 export type RealtimeHookKey
   // '<type>:<action>:<scope>' — scope is always present: '*' for all devices, or a source id
   = | `${DualScopeType}:${HookActionName}:${string}`
     | `measurements:${HookActionName}:${string}`
     | 'managedobjects:create:*'
+    | `managedobjects:create:*:${string}`
     | `managedobjects:${'update' | 'delete'}:${string}`
     // the onAny firehose: every type, every action, all devices
     | '*'
@@ -231,11 +314,56 @@ type ResolveHookPayload<T, A>
     : unknown
 
 /**
- * The payload type inferred from a {@link RealtimeHookKey}.
+ * `'a|b|c'` → `'a' | 'b' | 'c'`.
+ */
+type SplitPipe<S extends string> = S extends `${infer Head}|${infer Rest}` ? Head | SplitPipe<Rest> : S
+
+/**
+ * The literal type(s) a key's 4th segment names (given the part after the 2nd
+ * `:`), or `never` when there is no filter or it contains a `%` escape (then
+ * `type` stays `string`).
+ */
+type KeyTypeFilter<S extends string>
+  = S extends `${string}:${infer Ty}`
+    ? Ty extends `${string}%${string}` ? never : SplitPipe<Ty>
+    : never
+
+/**
+ * Keys whose filter segment is invalid, mapped to `never`: a filter on
+ * `operations` (no `type`), and an empty type in the segment (`'…:*:'`,
+ * `'…:a||b'`, `'…:|a'`, `'…:a|'`).
+ */
+export type FilterableKey<K extends string>
+  = K extends
+  | `operations:${string}:${string}:${string}`
+  | `${string}:${string}:${string}:`
+  | `${string}:${string}:${string}:${string}||${string}`
+  | `${string}:${string}:${string}:|${string}`
+  | `${string}:${string}:${string}:${string}|`
+    ? never
+    : K
+
+/**
+ * What an explicit payload generic on {@link RealtimeClient.hook} must satisfy:
+ * for a key with a type filter, an object whose `type` is (one of) those
+ * literal(s); otherwise unconstrained.
+ */
+export type HookKeyConstraint<K extends string>
+  = K extends `${string}:delete:${string}`
+    ? unknown
+    : K extends `${string}:${string}:${infer S}`
+      ? [KeyTypeFilter<S>] extends [never] ? unknown : { type: KeyTypeFilter<S> }
+      : unknown
+
+/**
+ * The payload type inferred from a {@link RealtimeHookKey}. A type-filter
+ * segment narrows the payload's `type` to that literal (or union).
  */
 export type HookKeyPayload<K extends string>
-  = K extends `${infer T}:${infer A}:${string}`
-    ? ResolveHookPayload<T, A>
+  = K extends `${infer T}:${infer A}:${infer S}`
+    ? [KeyTypeFilter<S>] extends [never] | [string] ? ResolveHookPayload<T, A> // no filter / escapes → no narrowing
+        : A extends 'delete' ? ResolveHookPayload<T, A> // a DELETE payload has no `type` to narrow
+          : ResolveHookPayload<T, A> & { type: KeyTypeFilter<S> }
     : K extends `${infer T}:${infer A}`
       ? ResolveHookPayload<T, A>
       : unknown
@@ -315,6 +443,21 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
 
 const WILDCARD = '*'
 const DEDUPE_WINDOW = 2048
+// Separates the base type from the filter-group hash in an internal topicKey
+// (`alarms~1a2b3c`). Not alphanumeric, so it can never clash with a type name.
+const FILTER_SEP = '~'
+
+/**
+ * A type-filter group: the canonical (deduped, code-point sorted) set of message
+ * types one topic forwards. Identified by a stable hash that is part of the
+ * topic name, so the same set always maps to the same platform resources.
+ */
+interface FilterGroup {
+  id: string
+  types: readonly string[]
+  odata: string
+  set: ReadonlySet<string>
+}
 
 /**
  * The Cumulocity alphanumeric subscription/subscriber-name rule: a `name` must
@@ -407,13 +550,13 @@ export class RealtimeClient {
   /**
    * Event notifications.
    */
-  readonly events: TypeHooks<C8yEvent>
+  readonly events: FilterableTypeHooks<C8yEvent>
   /**
    * Alarm notifications.
    */
-  readonly alarms: TypeHooks<Alarm>
+  readonly alarms: FilterableTypeHooks<Alarm>
   /**
-   * Operation notifications.
+   * Operation notifications (no type filter: operations carry no `type`).
    */
   readonly operations: TypeHooks<Operation>
 
@@ -448,7 +591,11 @@ export class RealtimeClient {
   // Unique-per-client handler labels → entry, for unhook(label).
   readonly #labels = new Map<string, HandlerEntry>()
 
-  // One consumer per topicKey (per type + '*' for onAny).
+  // Filter groups by topicKey (`<type>~<hash>`), for topic naming, the
+  // typeFilter on each subscription, the dispatch guard and public keys.
+  readonly #filterGroups = new Map<string, FilterGroup>()
+
+  // One consumer per topicKey (per type, per (type, filter group), + '*' for onAny).
   readonly #topicKeys = new Set<string>()
   readonly #topicStarted = new Set<string>()
   readonly #topicConsumers = new Map<string, () => Promise<void>>()
@@ -486,15 +633,15 @@ export class RealtimeClient {
     this.events = this.#dualNamespace<C8yEvent>('events')
     this.operations = this.#dualNamespace<Operation>('operations')
     this.measurements = {
-      onCreate: this.#idReg<Measurement>('measurements', 'create'),
-      onUpdate: this.#idReg<Measurement>('measurements', 'update'),
-      onDelete: this.#idReg<DeletionPayload>('measurements', 'delete'),
-      onAny: this.#idReg<Measurement | DeletionPayload>('measurements', WILDCARD),
+      onCreate: this.#reg<Measurement, FilterableRegister<Measurement, string>>('measurements', 'create'),
+      onUpdate: this.#reg<Measurement, FilterableRegister<Measurement, string>>('measurements', 'update'),
+      onDelete: this.#reg<DeletionPayload, FilteredRegister<DeletionPayload, string>>('measurements', 'delete'),
+      onAny: this.#reg<Measurement | DeletionPayload, FilteredRegister<Measurement | DeletionPayload, string>>('measurements', WILDCARD),
     }
     this.managedObjects = {
-      onCreate: this.#allReg<ManagedObject>('managedobjects', 'create'),
-      onUpdate: this.#idReg<ManagedObject>('managedobjects', 'update'),
-      onDelete: this.#idReg<DeletionPayload>('managedobjects', 'delete'),
+      onCreate: this.#reg<ManagedObject, FilterableRegister<ManagedObject, '*'>>('managedobjects', 'create'),
+      onUpdate: this.#reg<ManagedObject, FilterableRegister<ManagedObject, string>>('managedobjects', 'update'),
+      onDelete: this.#reg<DeletionPayload, FilteredRegister<DeletionPayload, string>>('managedobjects', 'delete'),
     }
   }
 
@@ -528,19 +675,25 @@ export class RealtimeClient {
    * rt.hook('alarms:create:145075', (alarm) => {})       // only device 145075
    * rt.hook('measurements:create:145075', (m) => {})     // id required
    * rt.hook('managedobjects:delete:145075', ({ id }) => {})
+   * rt.hook('alarms:create:*:c8y_TemperatureAlarm', (alarm) => {}) // type-filtered
+   * rt.hook('events:create:*:c8y_A|c8y_B', (ev) => {})            // several types
+   * rt.hook<'alarms:create:*:c8y_X', MyAlarm>('alarms:create:*:c8y_X', (a) => {}) // + your payload type
    * rt.hook('*', (payload, n) => {}) // firehose — same as rt.onAny(handler)
    * ```
    */
-  hook<K extends RealtimeHookKey>(
+  hook<K extends RealtimeHookKey, Q extends HookKeyConstraint<K> = HookKeyConstraint<K>>(
     key: K,
-    handler: NotificationHandler<HookKeyPayload<K>>,
+    // The operations/delete-with-filter rejection lives on the handler type (not
+    // `key: K & FilterableKey<K>`): an intersection on `key` breaks inference of
+    // K for template-literal keys such as `alarms:create:${scope}`.
+    handler: [FilterableKey<K>] extends [never] ? never : NotificationHandler<HookKeyPayload<K> & Q>,
     label?: string,
   ): Unsubscribe {
+    const h = handler as unknown as NotificationHandler<unknown>
     if (key === WILDCARD)
-      return this.#register(WILDCARD, WILDCARD, WILDCARD, handler as unknown as NotificationHandler<unknown>, label)
-    const [type = '', action = '', id] = key.split(':')
-    const scope = id && id.length > 0 ? id : WILDCARD
-    return this.#register(scope, type, action, handler as unknown as NotificationHandler<unknown>, label)
+      return this.#register(WILDCARD, WILDCARD, WILDCARD, h, label)
+    const { type, action, scope, types } = parseHookKey(key)
+    return this.#register(scope, type, action, h, label, types)
   }
 
   /**
@@ -596,7 +749,8 @@ export class RealtimeClient {
    * ```
    */
   unsubscribe(key: RealtimeHookKey): UnsubscribeResult {
-    return this.#removeAll(toHookKey(key), true)
+    const hookKey = tryToHookKey(key)
+    return hookKey ? this.#removeAll(hookKey, true) : { removed: false, count: 0, subscriptionDeleted: false }
   }
 
   /**
@@ -614,7 +768,8 @@ export class RealtimeClient {
    * @returns `{ removed, count }` — same shape as {@link unsubscribe}.
    */
   detach(key: RealtimeHookKey): UnsubscribeResult {
-    return this.#removeAll(toHookKey(key), false)
+    const hookKey = tryToHookKey(key)
+    return hookKey ? this.#removeAll(hookKey, false) : { removed: false, count: 0, subscriptionDeleted: false }
   }
 
   /**
@@ -641,7 +796,8 @@ export class RealtimeClient {
    * @param key
    */
   hasHook(key: RealtimeHookKey): boolean {
-    return (this.#hookHandlers.get(toHookKey(key))?.size ?? 0) > 0
+    const hookKey = tryToHookKey(key)
+    return hookKey ? (this.#hookHandlers.get(hookKey)?.size ?? 0) > 0 : false
   }
 
   /**
@@ -661,7 +817,7 @@ export class RealtimeClient {
     const keys: RealtimeHookKey[] = []
     for (const hookKey of this.#hookHandlers.keys()) {
       if (isKeyedHook(hookKey))
-        keys.push(toPublicKey(hookKey) as RealtimeHookKey)
+        keys.push(this.#toPublicKey(hookKey) as RealtimeHookKey)
     }
     return keys
   }
@@ -765,48 +921,49 @@ export class RealtimeClient {
 
   // ── namespaces ───────────────────────────────────────────────────────────
 
-  #dualNamespace<P>(type: NotificationTypeName): TypeHooks<P> {
+  #dualNamespace<P>(type: NotificationTypeName): FilterableTypeHooks<P> {
     return {
-      onCreate: this.#anyReg<P>(type, 'create'),
-      onUpdate: this.#anyReg<P>(type, 'update'),
-      onDelete: this.#anyReg<DeletionPayload>(type, 'delete'),
-      onAny: this.#anyReg<P | DeletionPayload>(type, WILDCARD),
+      onCreate: this.#reg<P, FilterableRegister<P, SourceScope>>(type, 'create'),
+      onUpdate: this.#reg<P, FilterableRegister<P, SourceScope>>(type, 'update'),
+      onDelete: this.#reg<DeletionPayload, FilteredRegister<DeletionPayload, SourceScope>>(type, 'delete'),
+      onAny: this.#reg<P | DeletionPayload, FilteredRegister<P | DeletionPayload, SourceScope>>(type, WILDCARD),
     }
   }
 
   #reg<P, R>(type: string, action: string): R {
     return ((a: unknown, b?: NotificationHandler<P>, c?: string) => {
-      const { scope, handler, label } = parseScopeArgs(a, b as NotificationHandler<unknown> | undefined, c)
-      return this.#register(scope, type, action, handler, label)
+      const { scope, handler, label, types } = parseScopeArgs(a, b as NotificationHandler<unknown> | undefined, c)
+      return this.#register(scope, type, action, handler, label, types)
     }) as R
-  }
-
-  #allReg<P>(type: string, action: string): AllRegister<P> {
-    return this.#reg<P, AllRegister<P>>(type, action)
-  }
-
-  #idReg<P>(type: string, action: string): IdRegister<P> {
-    return this.#reg<P, IdRegister<P>>(type, action)
-  }
-
-  #anyReg<P>(type: string, action: string): AnyRegister<P> {
-    return this.#reg<P, AnyRegister<P>>(type, action)
   }
 
   // ── registration & dispatch ──────────────────────────────────────────────
 
-  #register(scope: string, type: string, action: string, handler: NotificationHandler<unknown>, label?: string): Unsubscribe {
+  /**
+   * Register one handler. `type` is a notification type, or '*' for onAny;
+   * `types` (canonical, non-empty) turns it into a filtered registration on its
+   * own filter-group topic. The resulting **topicKey** (`type`, or
+   * `type~<hash>`) is what all per-topic state is keyed by.
+   * @param scope
+   * @param type
+   * @param action
+   * @param handler
+   * @param label
+   * @param types
+   */
+  #register(scope: string, type: string, action: string, handler: NotificationHandler<unknown>, label?: string, types?: readonly string[]): Unsubscribe {
     if (label != null && this.#labels.has(label)) {
       throw new Error(
         `realtime: a hook labeled ${JSON.stringify(label)} is already registered on this client; labels must be unique.`,
       )
     }
-    const hookKey = `${scope}#${type}:${action}`
-    const subKey = `${type}#${scope}`
+    const topicKey = types ? this.#filterTopicKey(type, types) : type
+    const hookKey = `${scope}#${topicKey}:${action}`
+    const subKey = `${topicKey}#${scope}`
     const wrapped = (payload: unknown, notification: Notification<unknown>): void | Promise<void> =>
       handler(payload, notification)
     const unhook = this.#hooks.hook(hookKey, wrapped as never)
-    const entry: HandlerEntry = { hookKey, subKey, type, scope, label, unhook, removed: false }
+    const entry: HandlerEntry = { hookKey, subKey, type: topicKey, scope, label, unhook, removed: false }
 
     let set = this.#hookHandlers.get(hookKey)
     if (!set) {
@@ -817,18 +974,17 @@ export class RealtimeClient {
     if (label != null)
       this.#labels.set(label, entry)
     this.#subHandlerCount.set(subKey, (this.#subHandlerCount.get(subKey) ?? 0) + 1)
-    let scopes = this.#typeScopes.get(type)
+    let scopes = this.#typeScopes.get(topicKey)
     if (!scopes) {
       scopes = new Set()
-      this.#typeScopes.set(type, scopes)
+      this.#typeScopes.set(topicKey, scopes)
     }
     scopes.add(scope)
 
-    // `type` is a notification type, or '*' for onAny — that is the topicKey.
-    this.#topicKeys.add(type)
-    this.#ensureSub(type, scope)
+    this.#topicKeys.add(topicKey)
+    this.#ensureSub(topicKey, scope)
     if (this.#autoStart)
-      this.#ensureTopicConsumer(type)
+      this.#ensureTopicConsumer(topicKey)
 
     // Idempotent: safe to call twice, or after unsubscribe/detach already removed
     // it — a second call is a no-op.
@@ -901,6 +1057,7 @@ export class RealtimeClient {
       if (scopes.size === 0) {
         this.#typeScopes.delete(entry.type)
         this.#closeConsumer(entry.type)
+        this.#filterGroups.delete(entry.type)
       }
     }
     return true
@@ -947,30 +1104,66 @@ export class RealtimeClient {
       close().catch(() => {})
   }
 
+  /**
+   * Platform topic name for a topicKey: `<name>All` (onAny), `<name><Type>`
+   * (unfiltered), or `<name><Type>F<hash>` (a filter group).
+   * @param topicKey
+   */
   #topicName(topicKey: string): string {
-    return topicKey === WILDCARD ? `${this.#base}All` : `${this.#base}${capitalize(topicKey)}`
+    if (topicKey === WILDCARD)
+      return `${this.#base}All`
+    const [type, hash] = splitTopicKey(topicKey)
+    return hash ? `${this.#base}${capitalize(type)}F${hash}` : `${this.#base}${capitalize(type)}`
   }
 
   /**
-   * Ensure the single-type subscription for `(type, scope)` exists. Created once;
-   * never modified. Its apis are exactly `[type]` (or `['*']` for onAny) and it
-   * forwards the **full** message — no `typeFilter`, no `fragmentsToCopy`, so any
-   * number of handlers can share one `(type, scope)` stream without conflict.
+   * Resolve (and memoize) the filter group for a canonical type set, returning
+   * its topicKey `<type>~<hash>`. Rejects filters where they cannot apply.
    * @param type
+   * @param types
+   */
+  #filterTopicKey(type: string, types: readonly string[]): string {
+    if (type === WILDCARD || type === 'operations') {
+      throw new TypeError(
+        `realtime: a type filter is not supported for ${type === WILDCARD ? 'the onAny firehose' : 'operations (no \`type\` field)'}`,
+      )
+    }
+    const group = toFilterGroup(types)
+    const topicKey = `${type}${FILTER_SEP}${group.id}`
+    const existing = this.#filterGroups.get(topicKey)
+    if (existing) {
+      if (existing.odata !== group.odata)
+        throw new Error(`realtime: filter hash collision between ${JSON.stringify(existing.types)} and ${JSON.stringify(group.types)}`)
+      return topicKey
+    }
+    this.#filterGroups.set(topicKey, group)
+    return topicKey
+  }
+
+  /**
+   * Ensure the single-type subscription for `(topicKey, scope)` exists. Created
+   * once; never modified. Its apis are exactly `[type]` (or `['*']` for onAny)
+   * and — for a filter group — its `typeFilter` is the group's OData expression.
+   * It forwards the **full** message (no `fragmentsToCopy`), so any number of
+   * handlers can share one `(topicKey, scope)` stream without conflict.
+   * @param topicKey
    * @param scope
    */
-  #ensureSub(type: string, scope: string): void {
-    const key = `${type}#${scope}`
+  #ensureSub(topicKey: string, scope: string): void {
+    const key = `${topicKey}#${scope}`
     if (this.#subs.has(key) || !this.#ensureSubscription)
       return
     const isTenant = scope === WILDCARD
+    const [type] = splitTopicKey(topicKey)
+    const group = this.#filterGroups.get(topicKey)
     const subscription: Subscription = {
       context: isTenant ? 'tenant' : 'mo',
-      subscription: this.#topicName(type),
+      subscription: this.#topicName(topicKey),
       source: isTenant ? undefined : { id: scope },
       nonPersistent: this.#nonPersistent,
       subscriptionFilter: {
-        apis: type === WILDCARD ? [...this.#apis] : [type as SubscriptionApi],
+        apis: topicKey === WILDCARD ? [...this.#apis] : [type as SubscriptionApi],
+        ...(group ? { typeFilter: group.odata } : {}),
       },
     }
     // If a delete for this `(type, scope)` is still in flight, wait for it to
@@ -1041,17 +1234,35 @@ export class RealtimeClient {
       return
     }
 
-    // The onAny ('*') topic fires onAny handlers; a typed topic fires that type's handlers.
+    // On a filter-group topic the server already filtered by `type`; guard anyway
+    // so a handler typed for `c8y_X` never sees anything else.
+    const group = this.#filterGroups.get(topicKey)
+    if (group) {
+      const payloadType = (notification.payload as { type?: unknown } | undefined)?.type
+      if (typeof payloadType === 'string' && !group.set.has(payloadType)) {
+        // Should never fire (the server filtered already); warn so a grammar
+        // mismatch is visible, and always ack — the user never sees this frame.
+        this.#logger.warn(`realtime: dropped ${type}:${action} of type ${JSON.stringify(payloadType)} not in filter ${group.odata}`)
+        notification.ack()
+        return
+      }
+    }
+
+    // The onAny ('*') topic fires onAny handlers; a typed topic fires that type's
+    // handlers; a filter-group topic fires that group's handlers (keyed by its topicKey).
+    // Unfiltered topics route on the frame's own type (as before); a filter-group
+    // topic is its own routing key.
+    const routeType = group ? topicKey : type
     const keys = topicKey === WILDCARD
       ? new Set<string>([
           `${source}#${WILDCARD}:${WILDCARD}`,
           `${WILDCARD}#${WILDCARD}:${WILDCARD}`,
         ])
       : new Set<string>([
-          `${source}#${type}:${action}`,
-          `${WILDCARD}#${type}:${action}`,
-          `${source}#${type}:${WILDCARD}`,
-          `${WILDCARD}#${type}:${WILDCARD}`,
+          `${source}#${routeType}:${action}`,
+          `${WILDCARD}#${routeType}:${action}`,
+          `${source}#${routeType}:${WILDCARD}`,
+          `${WILDCARD}#${routeType}:${WILDCARD}`,
         ])
     let handled = false
     for (const key of keys) {
@@ -1065,6 +1276,26 @@ export class RealtimeClient {
 
     if (this.#autoAck)
       notification.ack()
+  }
+
+  /**
+   * Inverse of {@link toHookKey}: map an internal `"<scope>#<topicKey>:<action>"`
+   * key back to the public `"<type>:<action>:<scope>[:<types>]"` form (the scope
+   * segment is always present, `'*'` for all devices; a filter group's types are
+   * appended canonically as the 4th segment).
+   * @param hookKey
+   */
+  #toPublicKey(hookKey: string): string {
+    if (hookKey === `${WILDCARD}#${WILDCARD}:${WILDCARD}`)
+      return WILDCARD
+    const at = hookKey.indexOf('#')
+    const scope = hookKey.slice(0, at)
+    const colon = hookKey.indexOf(':', at)
+    const topicKey = hookKey.slice(at + 1, colon)
+    const action = hookKey.slice(colon + 1)
+    const [type] = splitTopicKey(topicKey)
+    const group = this.#filterGroups.get(topicKey)
+    return `${type}:${action}:${scope}${group ? typeSegment(group.types) : ''}`
   }
 
   /**
@@ -1099,32 +1330,122 @@ function capitalize(value: string): string {
 }
 
 /**
- * Map a public hook key `"<type>:<action>:<scope>"` to the internal
- * `"<scope>#<type>:<action>"` form (an absent/empty scope ⇒ the `*` scope).
- * Mirrors the scope resolution in {@link RealtimeClient.hook}.
+ * Split an internal topicKey into `[type, hash]` (`hash` is `undefined` for an
+ * unfiltered topic).
+ * @param topicKey
+ */
+function splitTopicKey(topicKey: string): [type: string, hash: string | undefined] {
+  const at = topicKey.indexOf(FILTER_SEP)
+  return at === -1 ? [topicKey, undefined] : [topicKey.slice(0, at), topicKey.slice(at + 1)]
+}
+
+/**
+ * Parse a public hook key `"<type>:<action>:<scope>[:<types>]"`. The scope is
+ * required (absent/empty ⇒ `*`). Everything after the third `:` is the type
+ * filter: types separated by `|`, with `%7C` for a literal `|` and `%25` for a
+ * literal `%`. (Percent escapes, not backslashes: `'a\|b'` in a JS string
+ * literal is silently just `a|b`, so a backslash grammar would fail without any
+ * error.)
+ * @param key
+ */
+function parseHookKey(key: string): { type: string, action: string, scope: string, types: readonly string[] | undefined } {
+  const [type = '', action = '', id, ...rest] = key.split(':')
+  const scope = id && id.length > 0 ? id : WILDCARD
+  const types = rest.length > 0 ? canonicalTypes(rest.join(':').split('|').map(decodeTypeSegment)) : undefined
+  return { type, action, scope, types }
+}
+
+/**
+ * Decode one type from a key's filter segment (`%7C` → `|`, `%25` → `%`).
+ * @param encoded
+ */
+function decodeTypeSegment(encoded: string): string {
+  return encoded.replace(/%7C|%25/gi, (m) => (m.toUpperCase() === '%7C' ? '|' : '%'))
+}
+
+/**
+ * Encode one type for a key's filter segment (`%` → `%25`, `|` → `%7C`).
+ * @param type
+ */
+function encodeTypeSegment(type: string): string {
+  return type.replaceAll('%', '%25').replaceAll('|', '%7C')
+}
+
+/**
+ * {@link toHookKey} for the query/remove methods: a malformed filter segment
+ * (which `hook()` would reject with a TypeError) is simply "no such key".
+ * @param key
+ */
+function tryToHookKey(key: string): string | undefined {
+  try {
+    return toHookKey(key)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Map a public hook key to the internal `"<scope>#<topicKey>:<action>"` form.
+ * Mirrors the resolution in {@link RealtimeClient.hook}.
  * @param key
  */
 function toHookKey(key: string): string {
   if (key === WILDCARD)
     return `${WILDCARD}#${WILDCARD}:${WILDCARD}`
-  const [type = '', action = '', id] = key.split(':')
-  const scope = id && id.length > 0 ? id : WILDCARD
-  return `${scope}#${type}:${action}`
+  const { type, action, scope, types } = parseHookKey(key)
+  const topicKey = types ? `${type}${FILTER_SEP}${toFilterGroup(types).id}` : type
+  return `${scope}#${topicKey}:${action}`
 }
 
 /**
- * Inverse of {@link toHookKey}: map an internal `"<scope>#<type>:<action>"` key
- * back to the public `"<type>:<action>:<scope>"` form (the scope segment is
- * always present, `'*'` for all devices).
- * @param hookKey
+ * Canonicalize a type filter: deduped, sorted by UTF-16 code unit (the default
+ * `sort()` order — deterministic, which is all the hash needs), no empty entries.
+ * @param input
  */
-function toPublicKey(hookKey: string): string {
-  if (hookKey === `${WILDCARD}#${WILDCARD}:${WILDCARD}`)
-    return WILDCARD
-  const hash = hookKey.indexOf('#')
-  const scope = hookKey.slice(0, hash)
-  const typeAction = hookKey.slice(hash + 1)
-  return `${typeAction}:${scope}`
+function canonicalTypes(input: string | readonly string[]): readonly string[] {
+  const list = typeof input === 'string' ? [input] : [...input]
+  if (list.length === 0 || list.some((t) => typeof t !== 'string' || t.length === 0))
+    throw new TypeError('realtime: a type filter needs at least one non-empty type string')
+  return [...new Set(list)].sort()
+}
+
+/**
+ * Build the filter group (hash, OData expression, lookup set) for a canonical
+ * type set. Pure, so the same set always yields the same group id.
+ * @param types
+ */
+function toFilterGroup(types: readonly string[]): FilterGroup {
+  return {
+    id: fnv1a64Base36(types.map(encodeTypeSegment).join('|')),
+    types,
+    odata: types.map((t) => `'${t.replaceAll('\'', '\'\'')}'`).join(' or '),
+    set: new Set(types),
+  }
+}
+
+/**
+ * The canonical public 4th key segment for a type set: `:a|b|c`.
+ * @param types
+ */
+function typeSegment(types: readonly string[]): string {
+  return `:${types.map(encodeTypeSegment).join('|')}`
+}
+
+/**
+ * 64-bit FNV-1a over the UTF-16 code units of `input`, base36-encoded (≤ 13
+ * chars, alphanumeric) — stable across runs and runtimes.
+ * @param input
+ */
+function fnv1a64Base36(input: string): string {
+  const prime = 0x100000001B3n
+  const mask = 0xFFFFFFFFFFFFFFFFn
+  let hash = 0xCBF29CE484222325n
+  for (let i = 0; i < input.length; i++) {
+    const unit = input.charCodeAt(i)
+    hash = ((hash ^ BigInt(unit & 0xFF)) * prime) & mask
+    hash = ((hash ^ BigInt(unit >> 8)) * prime) & mask
+  }
+  return hash.toString(36)
 }
 
 /**
@@ -1144,8 +1465,8 @@ function isKeyedHook(hookKey: string): boolean {
 
 /**
  * Normalize a namespace register's `(scope, handler, label?)` arguments. The
- * scope is required (a `'*'`/id string); an empty string is treated as the
- * all-devices `*` scope.
+ * scope is required: a `'*'`/id string, or a {@link FilteredScope} object; an
+ * empty string is treated as the all-devices `*` scope.
  * @param a
  * @param b
  * @param c
@@ -1154,10 +1475,19 @@ function parseScopeArgs(
   a: unknown,
   b: NotificationHandler<unknown> | undefined,
   c: string | undefined,
-): { scope: string, handler: NotificationHandler<unknown>, label: string | undefined } {
-  if (typeof a !== 'string' || typeof b !== 'function')
+): { scope: string, handler: NotificationHandler<unknown>, label: string | undefined, types: readonly string[] | undefined } {
+  if (typeof b !== 'function')
     throw new TypeError('A source scope ("*" for all devices, or a device id) and a handler function are required')
-  return { scope: a.length > 0 ? a : WILDCARD, handler: b, label: typeof c === 'string' ? c : undefined }
+  const label = typeof c === 'string' ? c : undefined
+  if (typeof a === 'string')
+    return { scope: a.length > 0 ? a : WILDCARD, handler: b, label, types: undefined }
+  if (a && typeof a === 'object' && typeof (a as { source?: unknown }).source === 'string') {
+    const { source, type } = a as { source: string, type?: unknown }
+    if (typeof type !== 'string' && !Array.isArray(type))
+      throw new TypeError('A filtered scope needs a `type` (one type string, or a list of them)')
+    return { scope: source.length > 0 ? source : WILDCARD, handler: b, label, types: canonicalTypes(type as string | string[]) }
+  }
+  throw new TypeError('A source scope ("*" for all devices, a device id, or { source, type }) and a handler function are required')
 }
 
 /**
@@ -1169,6 +1499,7 @@ function parseScopeArgs(
  * const rt = createRealtimeClient({ name, baseUrl, tenant, user, password })
  * rt.alarms.onCreate('*', (alarm) => console.log(alarm.severity))      // all devices
  * rt.measurements.onCreate('12345', (m) => console.log(m.type))        // one device
+ * rt.alarms.onCreate({ source: '*', type: 'c8y_TemperatureAlarm' }, (alarm) => {}) // type-filtered
  * rt.hook('managedobjects:update:12345', (mo) => console.log(mo.id))
  * ```
  */

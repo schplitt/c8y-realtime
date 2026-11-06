@@ -39,8 +39,12 @@ rt.alarms.onCreate('12345', (alarm) => console.log(alarm.text))
 rt.events.onDelete('*', ({ id }) => console.log('deleted', id))
 rt.measurements.onCreate('12345', (m) => console.log(m.type, m.time))
 
+// Only some types (server-side filter; see "Type filters"):
+rt.alarms.onCreate({ source: '*', type: 'c8y_TemperatureAlarm' }, (alarm) => console.log(alarm.type))
+
 // Same thing as a single key string:
 rt.hook('alarms:create:*', (alarm) => console.log(alarm.severity))
+rt.hook('alarms:create:*:c8y_TemperatureAlarm', (alarm) => console.log(alarm.type))
 
 // Every notification:
 rt.onAny((payload, n) => console.log(n.description.type, n.action))
@@ -62,6 +66,53 @@ The device is always the first argument: `'*'` for all devices, or a device id. 
 | `alarms` / `events` / `operations` .*  | ✓           | ✓            |
 
 `onAny` is the exception: its device argument is optional (`rt.onAny(fn)` = all).
+
+## Type filters
+
+Pass `{ source, type }` instead of a bare device to receive only some message types. `type` is one type string or a list. The platform filters server-side (Notification 2.0 `typeFilter`), so the rest never reaches your process.
+
+```ts
+rt.alarms.onCreate({ source: '*', type: 'c8y_TemperatureAlarm' }, (alarm) => {
+  console.log(alarm.type) // 'c8y_TemperatureAlarm' — narrowed to what you asked for
+})
+rt.events.onCreate({ source: '12345', type: ['c8y_Boot', 'c8y_Shutdown'] }, (ev) => {
+  console.log(ev.type) // 'c8y_Boot' | 'c8y_Shutdown'
+})
+
+// Key form: the types as a 4th segment, several separated by `|`
+rt.hook('events:create:12345:c8y_Boot|c8y_Shutdown', handler)
+```
+
+In a key, everything after the third `:` is the filter, so a type containing `:` needs no escaping. Only two characters are ever encoded: a literal `|` is `%7C` and a literal `%` is `%25` (percent escapes on purpose: a backslash would silently vanish inside a JS string literal). The object form needs no escaping at all. `hookKeys()` returns the same canonical spelling (types sorted, duplicates removed), so a key you write and a key you get back always agree.
+
+Pass your own object type as the generic to type the fragments. Its `type` literal must match the filter, or it's a compile error; the handler gets the base payload (`Alarm`, …) intersected with yours.
+
+```ts
+interface TempAlarm { type: 'c8y_TemperatureAlarm', c8y_Temperature: { T: { value: number } } }
+interface DoorAlarm { type: 'c8y_DoorAlarm', c8y_Door: { open: boolean } }
+
+rt.alarms.onCreate<TempAlarm>({ source: '*', type: 'c8y_TemperatureAlarm' }, (alarm) => {
+  console.log(alarm.c8y_Temperature.T.value) // number; alarm.severity etc. still there
+})
+rt.alarms.onCreate<TempAlarm | DoorAlarm>({ source: '*', type: ['c8y_TemperatureAlarm', 'c8y_DoorAlarm'] }, (alarm) => {
+  if (alarm.type === 'c8y_DoorAlarm')
+    console.log(alarm.c8y_Door.open) // discriminated by `type`
+})
+
+rt.alarms.onCreate<TempAlarm>({ source: '*', type: 'c8y_DoorAlarm' }, handler) // ✗ type error
+rt.alarms.onCreate<TempAlarm>('*', handler) // ✗ a generic needs a filtered scope
+```
+
+The generic's `type` should be a literal (or a union of literals). With `type: string` nothing can be checked and the payload's `type` stays `string`.
+
+Available on `alarms`, `events`, `measurements` (the measurement `type`, not the series fragment), and `managedObjects`. Not on `operations` (no `type` field) or the global `rt.onAny`. `onDelete` and the per-type `onAny` take a filter too (the platform filters DELETEs by the deleted object's type), but their payload isn't narrowed, since a delete payload carries no `type`. The device rules above still apply.
+
+**How it works, and what it costs.** Cumulocity can't update a subscription in place, and its uniqueness key is `(device, context, subscription name)` regardless of filter. So every distinct set of types gets its **own topic and consumer**, named `<name><Type>F<hash>` from the sorted types, and inside it everything works like the unfiltered case: one immutable subscription per device, handlers fire once. Consequences:
+
+- One extra websocket per distinct type set. A filter you write once in code is one topic, reused across runs; building type sets from runtime input would create a topic per set.
+- A filtered and an unfiltered registration on the same device are independent: cancelling one never touches the other, and a message matching both arrives on both (each to its own handlers).
+- Removing, re-registering, `unsubscribe`, `detach`, `hookKeys()` work exactly as for unfiltered keys; the order of types in a key or list doesn't matter (`:b|a` ≡ `:a|b`).
+- A frame on a filtered topic whose `type` is outside the set is dropped (and acked), so a handler typed for `c8y_X` never sees anything else.
 
 ## API
 
@@ -88,9 +139,10 @@ Each returns an `Unsubscribe` function. Every register also takes an optional `l
 ```ts
 // `label` is optional in every register (see above).
 rt.alarms.onCreate(scope, handler, label) // scope: '*' or a device id
+rt.alarms.onCreate({ source: scope, type: 'c8y_X' }, handler, label) // + type filter
 rt.measurements.onUpdate(deviceId, handler) // device id required
 rt.managedObjects.onCreate('*', handler) // all devices only
-rt.hook('alarms:create:12345', handler, label) // key = '<type>:<action>:<scope>'
+rt.hook('alarms:create:12345', handler, label) // key = '<type>:<action>:<scope>[:<types>]'
 rt.onAny(handler, label) // or rt.onAny(deviceId, handler)
 ```
 
@@ -189,25 +241,23 @@ await client.close()
 ## What's not included, and why
 
 <details>
-<summary>No message filtering (no <code>typeFilter</code> / <code>fragmentsToCopy</code>)</summary>
+<summary>No <code>fragmentsToCopy</code> (payload trimming)</summary>
 
-Every subscription forwards the full message; filter inside your handler if you want a subset.
-
-Cumulocity can't change a subscription in place — only delete and recreate it. Changing a filter would mean a delete→create (can drop messages) or create→delete (can double-deliver), so we don't filter on the server at all. The upside: the subscription never changes, and any number of handlers can share one stream for the same device with no conflict. The cost: the full message reaches your process, and the platform no longer drops fields before they get to you.
+Every subscription forwards the full message. A trimmed and an untrimmed copy of the same message would look different to the duplicate suppression, and trimming is a per-subscription setting that can't be changed in place (see below). Type filtering is supported, see [Type filters](#type-filters).
 
 </details>
 
 <details>
 <summary>No changing a live subscription</summary>
 
-For the same reason — there's no safe in-place update — the client never edits a subscription after creating it. Removing the last handler deletes it (see [lifecycle](#subscription-lifecycle)); a new registration creates a fresh one.
+Cumulocity has no in-place update, only delete and recreate, which either drops messages (delete→create) or double-delivers (create→delete). So the client never edits a subscription after creating it: a type filter is part of the subscription's identity (its own topic), removing the last handler deletes it (see [lifecycle](#subscription-lifecycle)), and a new registration creates a fresh one.
 
 </details>
 
 <details>
-<summary>No options object — just a device and a handler</summary>
+<summary>No options object beyond <code>{ source, type }</code></summary>
 
-Registers take a positional device (`'*'` or an id) and a handler, plus an optional label. With no per-device filter settings left to pass, an options object added nothing, and one string key (`'<type>:<action>:<scope>'`) stays simple.
+Registers take a positional device (`'*'` or an id) or a `{ source, type }` scope, a handler, and an optional label. Both forms map to one string key (`'<type>:<action>:<scope>[:<types>]'`), so everything you register can be listed, checked, and removed by key.
 
 </details>
 

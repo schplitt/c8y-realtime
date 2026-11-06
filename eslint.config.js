@@ -1,6 +1,8 @@
 import schplitt from '@schplitt/eslint-config'
 
 export default schplitt({
+  // Local-only design records (gitignored), not part of the package.
+  ignores: ['internal/**'],
 }).append({
   // README code fences are illustrative snippets, not runnable modules: allow
   // top-level await, single-shot `for await … break`, console and void.
