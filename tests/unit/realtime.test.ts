@@ -690,6 +690,64 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
     await rt.close()
   })
 
+  it('a kept subscription (deleteSubscriptionOnEmpty: false) closes the topic connection and resumes without re-creating', async () => {
+    MockSocket.reset()
+    const { rt, posted, deleted } = lifecycleClient({ deleteSubscriptionOnEmpty: false, autoStart: true })
+    const off = rt.alarms.onCreate('111', () => {})
+    const first = await socketFor('c8yRealtimeAlarms')
+    off()
+    await waitFor(() => first.closedWith !== undefined) // nobody listens → connection closed, backlog accumulates server-side
+    expect(deleted).toEqual([])
+    rt.alarms.onCreate('111', () => {})
+    await waitFor(() => MockSocket.instances.length === 2) // resumed: new connection, same subscription
+    expect(posted).toEqual(['c8yRealtimeAlarms'])
+    await rt.close()
+  })
+
+  it('detach(key) closes the topic connection too, and a later start() does not re-create a detached subscription', async () => {
+    MockSocket.reset()
+    const { rt, posted } = lifecycleClient({ autoStart: true })
+    rt.alarms.onCreate('111', () => {})
+    const first = await socketFor('c8yRealtimeAlarms')
+    rt.detach('alarms:create:111')
+    await waitFor(() => first.closedWith !== undefined)
+    await rt.start()
+    expect(posted).toEqual(['c8yRealtimeAlarms']) // #ensureAllSubs only covers scopes with handlers
+    await rt.close()
+  })
+
+  it('a failed ensure is not cached: start() retries it', async () => {
+    MockSocket.reset()
+    let failNext = true
+    const posted: string[] = []
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string }) => {
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? JSON.parse(init.body) as { subscription?: string } : {}
+      if (url.includes('notification2/token'))
+        return json({ token: `tok-${body.subscription}` })
+      if (url.includes('notification2/subscriptions') && method === 'POST') {
+        posted.push(body.subscription ?? '')
+        if (failNext) {
+          failNext = false
+          return json({ error: 'boom' }, 500)
+        }
+        return json({ id: `sub-${posted.length}`, ...body }, 201)
+      }
+      return json({ subscriptions: [] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false })
+    rt.alarms.onCreate('111', () => {})
+    await rt.start() // first attempt fails (500) and is forgotten
+    expect(posted).toHaveLength(1)
+    expect(rt.ownedSubscriptionIds).toEqual([])
+    await rt.start() // retried
+    expect(posted).toHaveLength(2)
+    expect(rt.ownedSubscriptionIds).toEqual(['sub-2'])
+    await rt.start() // and not re-created once it exists
+    expect(posted).toHaveLength(2)
+    await rt.close()
+  })
+
   it('removes a single handler by unique label; reports removed + subscriptionDeleted', () => {
     MockSocket.reset()
     const { rt } = lifecycleClient()
@@ -730,6 +788,67 @@ describe('realtimeClient — acknowledgement', () => {
     await rt.close()
   })
 
+  it('with autoAck off, still acks a duplicate of an acked frame and an unhandled frame (never delivered, so nobody else can)', async () => {
+    MockSocket.reset()
+    const rt = makeRealtime({ autoAck: false })
+    let handled = 0
+    rt.alarms.onCreate('*', (_a, n) => {
+      handled += 1
+      n.ack() // the user acks
+    })
+    const socket = await socketFor('c8yRealtimeAlarms')
+    const f = frame('alarms', 'CREATE', '1', { id: 'a1' })
+    socket.emit('message', f)
+    await waitFor(() => handled === 1)
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1'])
+    socket.emit('message', f) // duplicate of an acked frame → never delivered → acked by the client
+    await waitFor(() => socket.sent.length >= 2)
+    expect(handled).toBe(1)
+    socket.emit('message', frame('alarms', 'UPDATE', '1', { id: 'a1', text: 'x' })) // no handler → acked
+    await waitFor(() => socket.sent.length >= 3)
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1', 'ACK-alarms-CREATE-1', 'ACK-alarms-UPDATE-1'])
+    await rt.close()
+  })
+
+  it('with autoAck off, a redelivery of a frame the user never acked runs the handler again; once acked it is dropped', async () => {
+    MockSocket.reset()
+    const rt = makeRealtime({ autoAck: false })
+    let ackIt: (() => void) | undefined
+    let handled = 0
+    rt.alarms.onCreate('*', (_a, n) => {
+      handled += 1
+      ackIt = n.ack
+    })
+    const socket = await socketFor('c8yRealtimeAlarms')
+    const f = frame('alarms', 'CREATE', '1', { id: 'a1' })
+    socket.emit('message', f)
+    await waitFor(() => handled === 1)
+    socket.emit('message', f) // redelivered (e.g. after a reconnect) while still unacked → delivered again
+    await waitFor(() => handled === 2)
+    expect(socket.sent).toEqual([])
+    ackIt!() // the user acks
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1'])
+    socket.emit('message', f) // now a true duplicate → dropped and acked by the client
+    await delay(20)
+    expect(handled).toBe(2)
+    await rt.close()
+  })
+
+  it('autoAck is at-most-once: a frame whose handler threw is still acked (and the error logged)', async () => {
+    MockSocket.reset()
+    const errors: string[] = []
+    const rt = makeRealtime({ logger: { debug() {}, info() {}, warn() {}, error: (m) => errors.push(String(m)) } })
+    rt.alarms.onCreate('*', () => {
+      throw new Error('handler boom')
+    })
+    const socket = await socketFor('c8yRealtimeAlarms')
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'a1' }))
+    await waitFor(() => socket.sent.length >= 1)
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1'])
+    expect(errors.some((m) => /handler threw/.test(m))).toBe(true)
+    await rt.close()
+  })
+
   it('does not auto-ack when autoAck is false', async () => {
     MockSocket.reset()
     const rt = makeRealtime({ autoAck: false })
@@ -758,6 +877,8 @@ describe('realtimeClient — updateCredentials (repair after creds run out)', ()
       listAuth: [] as string[],
       failTokenStatus: 0,
       failListStatus: 0,
+      failCreateStatus: 0,
+      created: 0,
     }
     const fetchImpl = (async (url: string, init?: { method?: string, body?: string, headers?: Record<string, string> }) => {
       const method = init?.method ?? 'GET'
@@ -767,8 +888,12 @@ describe('realtimeClient — updateCredentials (repair after creds run out)', ()
         state.tokenAuth.push(auth)
         return state.failTokenStatus ? json({ error: 'unauthorized' }, state.failTokenStatus) : json({ token: `tok-${body.subscription}` })
       }
-      if (url.includes('notification2/subscriptions') && method === 'POST')
+      if (url.includes('notification2/subscriptions') && method === 'POST') {
+        if (state.failCreateStatus)
+          return json({ error: 'unauthorized' }, state.failCreateStatus)
+        state.created += 1
         return json({ id: `sub-${body.subscription}`, ...body }, 201)
+      }
       // GET notification2/subscriptions — the updateCredentials auth probe.
       state.listAuth.push(auth)
       return state.failListStatus ? json({ error: 'unauthorized' }, state.failListStatus) : json({ subscriptions: [] })
@@ -788,6 +913,42 @@ describe('realtimeClient — updateCredentials (repair after creds run out)', ()
       resilience: { pingIntervalMs: 10_000, pongTimeoutMs: 10_000, initialBackoffMs: 5, maxBackoffMs: 20 },
     })
   }
+
+  it('re-creates a subscription whose ensure failed under the expired creds', async () => {
+    MockSocket.reset()
+    const { fetchImpl, state } = credFetch()
+    state.failTokenStatus = 401
+    state.failCreateStatus = 401 // the ensure fails too while creds are expired
+    const rt = makeCredRealtime(fetchImpl)
+    rt.alarms.onCreate('*', () => {})
+    await waitFor(() => !rt.healthy)
+    await delay(10)
+    expect(state.created).toBe(0)
+
+    state.failTokenStatus = 0
+    state.failCreateStatus = 0
+    await rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p2' })
+    await waitFor(() => state.created === 1) // the subscription is now created with the new creds
+    await socketFor('c8yRealtimeAlarms')
+    expect(rt.healthy).toBe(true)
+    expect(rt.ownedSubscriptionIds).toEqual(['sub-c8yRealtimeAlarms'])
+    await rt.close()
+  })
+
+  it('rejects a different tenant or baseUrl before touching anything', async () => {
+    MockSocket.reset()
+    const { fetchImpl, state } = credFetch()
+    state.failTokenStatus = 401
+    const rt = makeCredRealtime(fetchImpl)
+    rt.alarms.onCreate('*', () => {})
+    await waitFor(() => !rt.healthy)
+    await expect(rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 'other', user: 'u', password: 'p2' })).rejects.toThrow(/same tenant and baseUrl/)
+    await expect(rt.updateCredentials({ baseUrl: 'https://b.com', tenant: 't', user: 'u', password: 'p2' })).rejects.toThrow(/same tenant and baseUrl/)
+    expect(state.listAuth.length).toBe(0) // no validation probe ran
+    expect(rt.healthy).toBe(false)
+    await rt.updateCredentials({ baseUrl: 'https://a.com/', tenant: 't', user: 'u', password: 'p2' }) // trailing slash is the same URL
+    await rt.close()
+  })
 
   it('rejects updating a healthy client and changes nothing', async () => {
     MockSocket.reset()

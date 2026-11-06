@@ -84,6 +84,14 @@ export class NotificationClient {
    * `tenant` and `baseUrl` stay the same and only the user/password change.
    * @param credentials
    */
+  /**
+   * The credentials currently in use (tenant, base URL, user; the password is
+   * included as given).
+   */
+  get credentials(): TenantCredentials {
+    return this.#credentials
+  }
+
   setCredentials(credentials: TenantCredentials): void {
     this.#credentials = {
       baseUrl: credentials.baseUrl,
