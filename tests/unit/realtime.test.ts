@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, expectTypeOf, it } from 'vitest'
 import { createRealtimeClient, isValidRealtimeName, REALTIME_NAME_REGEX, toRealtimeName } from '../../src/realtime'
 import { delay, MockSocket, waitFor } from './mock-socket'
 import type { Alarm, DeletionPayload } from '../../src/domain'
-import type { RealtimeClientOptions } from '../../src/realtime'
+import type { RealtimeClientOptions, TypeHooks } from '../../src/realtime'
 import type { WebSocketFactory } from '../../src/types'
 
 /**
@@ -264,7 +264,7 @@ describe('realtimeClient — subscriptions are single-type, forward everything',
     await rt.close()
   })
 
-  it('never sends a typeFilter or fragmentsToCopy — subscriptions forward the full message', async () => {
+  it('unfiltered registrations never send a typeFilter or fragmentsToCopy — they forward the full message', async () => {
     MockSocket.reset()
     const { rt, posted } = capturingClient()
     rt.measurements.onCreate('2468', () => {})
@@ -690,7 +690,7 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
     await rt.close()
   })
 
-  it('removes a single handler by unique label; reports found + subscriptionDeleted', () => {
+  it('removes a single handler by unique label; reports removed + subscriptionDeleted', () => {
     MockSocket.reset()
     const { rt } = lifecycleClient()
     rt.alarms.onCreate('111', () => {}, 'featureA')
@@ -733,13 +733,13 @@ describe('realtimeClient — acknowledgement', () => {
   it('does not auto-ack when autoAck is false', async () => {
     MockSocket.reset()
     const rt = makeRealtime({ autoAck: false })
-    let acked = false
+    let handled = false
     rt.alarms.onCreate('*', () => {
-      acked = true
+      handled = true
     })
     const socket = await socketFor('c8yRealtimeAlarms')
     socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'a1' }))
-    await waitFor(() => acked)
+    await waitFor(() => handled)
     await delay(20)
     expect(socket.sent).toEqual([])
     await rt.close()
@@ -890,5 +890,372 @@ describe('realtimeClient — updateCredentials (repair after creds run out)', ()
     await delay(20)
     expect(MockSocket.instances.length).toBe(0)
     await rt.close()
+  })
+})
+
+describe('realtimeClient — type filters (one topic per filter group)', () => {
+  function filterClient(overrides: Partial<RealtimeClientOptions> = {}) {
+    const posted: Array<{ id: string, subscription: string, context?: string, source?: { id?: string }, subscriptionFilter?: { apis?: string[], typeFilter?: string } }> = []
+    const deleted: string[] = []
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string }) => {
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? JSON.parse(init.body) as Record<string, unknown> : {}
+      if (url.includes('notification2/token'))
+        return json({ token: `tok-${(body as { subscription?: string }).subscription}` })
+      if (url.includes('notification2/subscriptions') && method === 'POST') {
+        const id = `sub-${posted.length + 1}`
+        posted.push({ id, ...(body as { subscription: string }) })
+        return json({ id, ...body }, 201)
+      }
+      if (url.includes('notification2/subscriptions/') && method === 'DELETE') {
+        deleted.push(url.split('/').pop()!.split('?')[0]!)
+        return new Response(null, { status: 204 })
+      }
+      return json({ subscriptions: [] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({
+      name: 'c8yRealtime',
+      baseUrl: 'https://a.com',
+      tenant: 't',
+      user: 'u',
+      password: 'p',
+      webSocketImpl: MockSocket as unknown as WebSocketFactory,
+      fetchImpl,
+      resilience: { pingIntervalMs: 10_000, pongTimeoutMs: 10_000, initialBackoffMs: 5, maxBackoffMs: 20 },
+      ...overrides,
+    })
+    return { rt, posted, deleted }
+  }
+
+  const FILTERED_TOPIC = /^c8yRealtimeAlarmsF[a-z0-9]{1,13}$/
+
+  it('creates a filtered single-type subscription on its own F<hash> topic with the OData typeFilter', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoStart: false })
+    rt.alarms.onCreate({ source: '*', type: ['c8y_B', 'c8y_A'] }, () => {})
+    await rt.start()
+    expect(posted).toHaveLength(1)
+    const sub = posted[0]!
+    expect(sub.subscription).toMatch(FILTERED_TOPIC)
+    expect(sub.context).toBe('tenant')
+    expect(sub.subscriptionFilter?.apis).toEqual(['alarms'])
+    expect(sub.subscriptionFilter?.typeFilter).toBe('\'c8y_A\' or \'c8y_B\'')
+    await rt.close()
+  })
+
+  it('the topic name is a stable function of the type set (a hash change would silently create new topics)', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoStart: false })
+    rt.alarms.onCreate({ source: '*', type: ['c8y_A', 'c8y_B'] }, () => {})
+    await rt.start()
+    // FNV-1a 64 of "c8y_A|c8y_B", base36. Pinned on purpose: existing deployments
+    // reuse this name across runs, so it must never drift.
+    expect(posted[0]!.subscription).toBe('c8yRealtimeAlarmsFfqww3fy4jkgq')
+    await rt.close()
+  })
+
+  it('a filtered per-type onAny and a filtered device scope route on the group topic; detach keeps the group', async () => {
+    MockSocket.reset()
+    const { rt, posted, deleted } = filterClient()
+    const seen: string[] = []
+    rt.alarms.onAny({ source: '7', type: 'c8y_A' }, (p, n) => {
+      seen.push(`${n.action}:${String((p as { id: string }).id)}`)
+    })
+    await rt.start()
+    expect(posted[0]!.context).toBe('mo')
+    expect(posted[0]!.subscriptionFilter?.typeFilter).toBe('\'c8y_A\'')
+    const socket = await socketFor(posted[0]!.subscription)
+    socket.emit('message', frame('alarms', 'CREATE', '7', { id: 'c', type: 'c8y_A', source: { id: '7' } }))
+    socket.emit('message', frame('alarms', 'DELETE', '7', { id: 'd' }))
+    await waitFor(() => seen.length >= 2)
+    expect(seen).toEqual(['CREATE:c', 'DELETE:d'])
+    // detach on a filtered key: handlers gone, remote kept
+    rt.alarms.onCreate({ source: '7', type: 'c8y_A' }, () => {})
+    expect(rt.detach('alarms:create:7:c8y_A')).toMatchObject({ removed: true, count: 1, subscriptionDeleted: false })
+    await delay(10)
+    expect(deleted).toEqual([])
+    await rt.close()
+  })
+
+  it('a single type is sent quoted; an inner quote is doubled (OData escaping)', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoStart: false })
+    rt.events.onCreate({ source: '12345', type: 'c8y_O\'Brien' }, () => {})
+    await rt.start()
+    expect(posted[0]?.context).toBe('mo')
+    expect(posted[0]?.source?.id).toBe('12345')
+    expect(posted[0]?.subscriptionFilter?.typeFilter).toBe('\'c8y_O\'\'Brien\'')
+    await rt.close()
+  })
+
+  it('the same type set in any order / with duplicates maps to ONE topic and ONE subscription', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoStart: false })
+    rt.alarms.onCreate({ source: '*', type: ['c8y_A', 'c8y_B'] }, () => {})
+    rt.alarms.onCreate({ source: '*', type: ['c8y_B', 'c8y_A', 'c8y_B'] }, () => {})
+    rt.alarms.onUpdate({ source: '*', type: 'c8y_A' }, () => {}) // different set → different topic
+    await rt.start()
+    expect(posted).toHaveLength(2)
+    expect(posted[0]!.subscription).not.toBe(posted[1]!.subscription)
+    expect(posted.every((p) => FILTERED_TOPIC.test(p.subscription))).toBe(true)
+    await rt.close()
+  })
+
+  it('filtered and unfiltered on the same scope are separate topics; each frame fires only its own handlers, once', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient()
+    const all: string[] = []
+    const onlyA: string[] = []
+    rt.alarms.onCreate('*', (a) => {
+      all.push(a.id)
+    })
+    rt.alarms.onCreate({ source: '*', type: 'c8y_A' }, (a) => {
+      onlyA.push(a.id)
+    })
+    await rt.start()
+    const filteredName = posted.find((p) => p.subscriptionFilter?.typeFilter)!.subscription
+    const plain = await socketFor('c8yRealtimeAlarms')
+    const filtered = await socketFor(filteredName)
+    expect(plain).not.toBe(filtered)
+    plain.emit('message', frame('alarms', 'CREATE', '1', { id: 'p1', type: 'c8y_A', source: { id: '1' } }))
+    filtered.emit('message', frame('alarms', 'CREATE', '1', { id: 'f1', type: 'c8y_A', source: { id: '1' } }))
+    await waitFor(() => all.length >= 1 && onlyA.length >= 1)
+    await delay(20)
+    expect(all).toEqual(['p1'])
+    expect(onlyA).toEqual(['f1'])
+    await rt.close()
+  })
+
+  it('guards a filter-group topic: a frame whose type is outside the set is acked and dropped', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient()
+    const seen: string[] = []
+    rt.alarms.onCreate({ source: '*', type: 'c8y_A' }, (a) => {
+      seen.push(a.type)
+    })
+    await rt.start()
+    const socket = await socketFor(posted[0]!.subscription)
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'x', type: 'c8y_Other', source: { id: '1' } }))
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'y', type: 'c8y_A', source: { id: '1' } }))
+    await waitFor(() => seen.length >= 1)
+    expect(seen).toEqual(['c8y_A'])
+    await waitFor(() => socket.sent.length >= 2)
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1', 'ACK-alarms-CREATE-1'])
+    await rt.close()
+  })
+
+  it('a filtered onDelete shares the group topic and passes the type-less DELETE payload through the guard', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient()
+    const deletes: string[] = []
+    rt.alarms.onCreate({ source: '*', type: 'c8y_A' }, () => {})
+    rt.alarms.onDelete({ source: '*', type: 'c8y_A' }, ({ id }) => {
+      deletes.push(id)
+    })
+    await rt.start()
+    expect(posted).toHaveLength(1) // same (group, scope) → one subscription
+    expect(posted[0]!.subscriptionFilter?.typeFilter).toBe('\'c8y_A\'')
+    const socket = await socketFor(posted[0]!.subscription)
+    socket.emit('message', frame('alarms', 'DELETE', '1', { id: 'gone' }))
+    await waitFor(() => deletes.length >= 1)
+    expect(deletes).toEqual(['gone'])
+    await rt.close()
+  })
+
+  it('the guard acks a dropped out-of-set frame even with autoAck off', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoAck: false })
+    rt.alarms.onCreate({ source: '*', type: 'c8y_A' }, () => {})
+    await rt.start()
+    const socket = await socketFor(posted[0]!.subscription)
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'x', type: 'c8y_Other', source: { id: '1' } }))
+    await waitFor(() => socket.sent.length >= 1)
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1'])
+    await rt.close()
+  })
+
+  it('the 4th-segment key form is the same registration as the object form', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoStart: false })
+    const seen: string[] = []
+    rt.hook('alarms:create:*:c8y_B|c8y_A', (a) => {
+      seen.push(`key:${a.id}`)
+    })
+    rt.alarms.onCreate({ source: '*', type: ['c8y_A', 'c8y_B'] }, (a) => {
+      seen.push(`obj:${a.id}`)
+    })
+    await rt.start()
+    expect(posted).toHaveLength(1)
+    expect(rt.hookKeys()).toEqual(['alarms:create:*:c8y_A|c8y_B'])
+    expect(rt.hasHook('alarms:create:*:c8y_B|c8y_A')).toBe(true)
+    expect(rt.hasHook('alarms:create:*:c8y_A|c8y_B|c8y_A')).toBe(true) // duplicates collapse
+    const socket = await socketFor(posted[0]!.subscription)
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: '1', type: 'c8y_A', source: { id: '1' } }))
+    await waitFor(() => seen.length >= 2)
+    expect(seen.sort()).toEqual(['key:1', 'obj:1'])
+    await rt.close()
+  })
+
+  it('canonical keys keep ":", "#", spaces and quotes literal, escape only "|" and "%", and round-trip', () => {
+    const { rt } = filterClient({ autoStart: false, ensureSubscription: false })
+    rt.events.onCreate({ source: '42', type: ['my type', 'a:b#c', 'o\'k', 'p|q', '100%', 'back\\slash'] }, () => {})
+    const [key] = rt.hookKeys()
+    expect(key).toBe('events:create:42:100%25|a:b#c|back\\slash|my type|o\'k|p%7Cq')
+    expect(rt.hasHook(key!)).toBe(true)
+    expect(rt.hasHook('events:create:42:p%7cq|back\\slash|100%25|a:b#c|my type|o\'k')).toBe(true) // case-insensitive escapes, any order
+    expect(rt.unsubscribe(key!)).toMatchObject({ removed: true, count: 1 })
+    expect(rt.hookKeys()).toEqual([])
+    // a type with ":" in the key form needs no escaping
+    rt.hook('events:create:*:lora:uplink', () => {})
+    expect(rt.hookKeys()).toEqual(['events:create:*:lora:uplink'])
+  })
+
+  it('rejects filters where they cannot apply, and malformed keys', () => {
+    const { rt } = filterClient({ autoStart: false, ensureSubscription: false })
+    const fn = (): void => {}
+    // runtime guards (the types already forbid these; cast to reach them)
+    const ops = rt.operations as unknown as { onCreate: (s: unknown, h: () => void) => void }
+    expect(() => ops.onCreate({ source: '*', type: 'x' }, fn)).toThrow(/not supported for operations/)
+    // (cast the key to an allowed literal so the compile-time rejection is bypassed; runtime still sees the real string)
+    expect(() => rt.hook('operations:create:*:x' as 'operations:create:*', fn)).toThrow(/not supported for operations/)
+    expect(() => rt.alarms.onCreate({ source: '*', type: [] }, fn)).toThrow(/invalid type filter \[\]/)
+    expect(() => rt.alarms.onCreate({ source: '*', type: '' }, fn)).toThrow(/invalid type filter ""/)
+    expect(() => rt.hook('alarms:create:*:' as 'alarms:create:*', fn)).toThrow(/invalid type filter/)
+    expect(() => rt.hook('alarms:create:*:a||b' as 'alarms:create:*', fn)).toThrow(/doubled "\|"/)
+    expect(() => (rt.alarms.onCreate as (a: unknown, b: unknown) => void)({ source: 7, type: 'x' }, fn)).toThrow(/must be a string/)
+    expect(() => (rt.alarms.onCreate as (a: unknown, b?: unknown) => void)('*')).toThrow(/handler is missing/)
+    // query/remove methods never throw: a malformed key is simply "no such key"
+    expect(rt.hasHook('alarms:create:*:')).toBe(false)
+    expect(rt.unsubscribe('alarms:create:*:a||b')).toEqual({ removed: false, count: 0, subscriptionDeleted: false })
+    expect(rt.detach('alarms:create:*:')).toEqual({ removed: false, count: 0, subscriptionDeleted: false })
+    expect(rt.hookKeys()).toEqual([])
+  })
+
+  it('delete-on-empty removes only the filtered subscription and closes only its socket', async () => {
+    MockSocket.reset()
+    const { rt, posted, deleted } = filterClient()
+    rt.alarms.onCreate('*', () => {})
+    const off = rt.alarms.onCreate({ source: '*', type: 'c8y_A' }, () => {})
+    await rt.start()
+    const filteredSub = posted.find((p) => p.subscriptionFilter?.typeFilter)!
+    const plain = await socketFor('c8yRealtimeAlarms')
+    const filtered = await socketFor(filteredSub.subscription)
+    off()
+    await delay(20)
+    expect(deleted).toEqual([filteredSub.id])
+    expect(filtered.closedWith).toBeDefined()
+    expect(plain.closedWith).toBeUndefined()
+    expect(rt.hookKeys()).toEqual(['alarms:create:*'])
+    await rt.close()
+  })
+
+  it('re-registering the same filter after removal recreates it on the SAME topic name', async () => {
+    MockSocket.reset()
+    const { rt, posted } = filterClient({ autoStart: false })
+    const off = rt.alarms.onCreate({ source: '7', type: 'c8y_A' }, () => {})
+    await rt.start()
+    off()
+    await delay(20)
+    rt.alarms.onCreate({ source: '7', type: 'c8y_A' }, () => {})
+    await rt.start()
+    expect(posted).toHaveLength(2)
+    expect(posted[0]!.subscription).toBe(posted[1]!.subscription)
+    await rt.close()
+  })
+
+  it('narrows the payload type: literal `type`, and an explicit payload generic that must match the filter', () => {
+    const { rt } = filterClient({ autoStart: false, ensureSubscription: false })
+    // plain user-defined shapes — no helper types; base Alarm fields are added by the namespace
+    interface TempAlarm { type: 'c8y_TemperatureAlarm', c8y_Temperature: { T: { value: number } } }
+    interface DoorAlarm { type: 'c8y_DoorAlarm', c8y_Door: { open: boolean } }
+
+    rt.alarms.onCreate({ source: '*', type: 'c8y_X' }, (a) => {
+      expectTypeOf(a.type).toEqualTypeOf<'c8y_X'>()
+    })
+    rt.alarms.onCreate({ source: '*', type: ['c8y_X', 'c8y_Y'] }, (a) => {
+      expectTypeOf(a.type).toEqualTypeOf<'c8y_X' | 'c8y_Y'>()
+    })
+    rt.alarms.onCreate<TempAlarm>({ source: '*', type: 'c8y_TemperatureAlarm' }, (a) => {
+      expectTypeOf(a.c8y_Temperature.T.value).toEqualTypeOf<number>()
+      expectTypeOf(a.severity).toEqualTypeOf<Alarm['severity']>() // base fields still there
+      expectTypeOf(a.type).toEqualTypeOf<'c8y_TemperatureAlarm'>()
+    })
+    rt.alarms.onCreate<TempAlarm | DoorAlarm>({ source: '*', type: ['c8y_TemperatureAlarm', 'c8y_DoorAlarm'] }, (a) => {
+      if (a.type === 'c8y_DoorAlarm')
+        expectTypeOf(a.c8y_Door.open).toEqualTypeOf<boolean>()
+    })
+    rt.hook('alarms:create:*:c8y_Z', (a) => {
+      expectTypeOf(a.type).toEqualTypeOf<'c8y_Z'>()
+    })
+    rt.hook('events:create:12345:c8y_A|c8y_B', (ev) => {
+      expectTypeOf(ev.type).toEqualTypeOf<'c8y_A' | 'c8y_B'>()
+    })
+    rt.hook('events:create:*:weird%7Ctype', (ev) => {
+      expectTypeOf(ev.type).toEqualTypeOf<string>() // escapes → no narrowing
+    })
+    rt.hook<'alarms:create:*:c8y_TemperatureAlarm', TempAlarm>('alarms:create:*:c8y_TemperatureAlarm', (a) => {
+      expectTypeOf(a.c8y_Temperature.T.value).toEqualTypeOf<number>()
+      expectTypeOf(a.severity).toEqualTypeOf<Alarm['severity']>()
+    })
+    rt.hook<'alarms:create:*:c8y_TemperatureAlarm|c8y_DoorAlarm', TempAlarm | DoorAlarm>('alarms:create:*:c8y_TemperatureAlarm|c8y_DoorAlarm', (a) => {
+      if (a.type === 'c8y_DoorAlarm')
+        expectTypeOf(a.c8y_Door.open).toEqualTypeOf<boolean>()
+    })
+    rt.hook('managedobjects:create:*:c8y_Device', (mo) => {
+      expectTypeOf(mo.type).toEqualTypeOf<'c8y_Device'>()
+    })
+    // onDelete / onAny accept a filter but never narrow (a DELETE payload has no `type`)
+    rt.alarms.onDelete({ source: '*', type: 'c8y_X' }, (d) => {
+      expectTypeOf(d).toEqualTypeOf<DeletionPayload>()
+    })
+    rt.hook('alarms:delete:*:c8y_X', (d) => {
+      expectTypeOf(d).toEqualTypeOf<DeletionPayload>()
+    })
+    rt.alarms.onAny({ source: '7', type: ['c8y_X', 'c8y_Y'] }, (p) => {
+      expectTypeOf(p).toEqualTypeOf<Alarm | DeletionPayload>()
+    })
+    // generic code written against the plain namespace shape still accepts every namespace
+    const wire = <P>(h: TypeHooks<P>): TypeHooks<P> => h
+    wire(rt.alarms)
+    wire(rt.operations)
+    // keys built from a variable keep their payload type (regression guard)
+    const scope: string = '12345'
+    rt.hook(`alarms:create:${scope}`, (a) => {
+      expectTypeOf(a).toEqualTypeOf<Alarm>()
+    })
+    rt.hook(`alarms:create:*:${scope}`, (a) => {
+      expectTypeOf(a.type).toEqualTypeOf<string>()
+    })
+    rt.alarms.onCreate('*', (a) => {
+      expectTypeOf(a.type).toEqualTypeOf<string>()
+    })
+
+    // compile-time only: these must be type errors (and would throw at runtime), so never call this
+    const _mustNotCompile = (): void => {
+      // @ts-expect-error the filter must be assignable to the generic's `type`
+      rt.alarms.onCreate<TempAlarm>({ source: '*', type: 'c8y_DoorAlarm' }, () => {})
+      // @ts-expect-error one of the listed types is outside the union
+      rt.alarms.onCreate<TempAlarm | DoorAlarm>({ source: '*', type: ['c8y_TemperatureAlarm', 'c8y_Other'] }, () => {})
+      // @ts-expect-error a payload generic needs a filtered scope
+      rt.alarms.onCreate<TempAlarm>('*', () => {})
+      // @ts-expect-error operations have no `type`
+      rt.operations.onCreate({ source: '*', type: 'x' }, () => {})
+      // @ts-expect-error managedobjects:create is all-devices only
+      rt.managedObjects.onCreate({ source: '123', type: 'x' }, () => {})
+      // @ts-expect-error the key's type must match the generic's `type`
+      rt.hook<'alarms:create:*:c8y_DoorAlarm', TempAlarm>('alarms:create:*:c8y_DoorAlarm', () => {})
+      // @ts-expect-error operations keys cannot carry a filter
+      rt.hook('operations:create:*:x', () => {})
+      // @ts-expect-error empty type in the filter segment
+      rt.hook('alarms:create:*:', () => {})
+      // @ts-expect-error empty type in the filter segment
+      rt.hook('alarms:create:*:a||b', () => {})
+      // @ts-expect-error empty type in the filter segment
+      rt.hook('alarms:create:*:a|', () => {})
+    }
+    expect(typeof _mustNotCompile).toBe('function')
+    rt.managedObjects.onCreate({ source: '*', type: 'c8y_Device' }, (mo) => {
+      expectTypeOf(mo.type).toEqualTypeOf<'c8y_Device'>()
+    })
   })
 })
