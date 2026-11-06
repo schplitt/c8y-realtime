@@ -57,6 +57,7 @@
  */
 import { createHooks } from 'hookable'
 import { createNotificationClient } from './client'
+import { normalizeBaseUrl } from './http'
 import type { NotificationClient } from './client'
 import type {
   Alarm,
@@ -417,11 +418,14 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
    * handler, so nobody else could ack them and they would otherwise be
    * redelivered on every reconnect.
    *
-   * With `autoAck: false`, a frame you have **not** acked is never treated as
-   * a duplicate: when the platform redelivers it (reconnect), your handlers run
-   * again — at-least-once, as intended. The flip side is that overlapping
-   * subscriptions (tenant + device on one topic) can deliver the same message
-   * twice until you ack it.
+   * `true` is **at-most-once**: the frame is acked after its handlers finish,
+   * even if one of them threw (the error is logged). `false` is
+   * **at-least-once**: ack on success only; a frame you have not acked is
+   * redelivered by the platform when the connection is re-established (there
+   * is no nack / on-demand redelivery in Notification 2.0), and your handlers
+   * run again — it is never treated as a duplicate. The flip side is that
+   * overlapping subscriptions (tenant + device on one topic) can deliver the
+   * same message twice until you ack it.
    */
   autoAck?: boolean
   /**
@@ -877,7 +881,7 @@ export class RealtimeClient {
    * (unsubscribe→resubscribe). Handlers and remote subscriptions are kept; the
    * stopped consumers are reconnected with the new credentials. The `tenant` and
    * `baseUrl` must stay the same — only the user/password may change (a different
-   * tenant is a different client).
+   * tenant is a different client); a mismatch throws before anything is touched.
    *
    * You may **only** call this while {@link healthy} is `false`. Replacing the
    * credentials of a live, healthy client is not allowed — its sockets already
@@ -908,6 +912,15 @@ export class RealtimeClient {
     if (this.healthy) {
       throw new Error(
         'realtime: cannot update credentials while the client is healthy — credentials can only be replaced after a consumer has stopped (e.g. its credentials ran out).',
+      )
+    }
+
+    // Rotation keeps the tenant and base URL: a mismatch is a bug, not a request
+    // to move the client (a different tenant is a different client).
+    const current = this.#client.credentials
+    if (credentials.tenant !== current.tenant || normalizeBaseUrl(credentials.baseUrl) !== normalizeBaseUrl(current.baseUrl)) {
+      throw new TypeError(
+        `realtime: updateCredentials must keep the same tenant and baseUrl (got ${credentials.tenant} @ ${credentials.baseUrl}, client is ${current.tenant} @ ${current.baseUrl})`,
       )
     }
 
@@ -1335,10 +1348,20 @@ export class RealtimeClient {
           `${WILDCARD}#${routeType}:${WILDCARD}`,
         ])
     let handled = false
-    for (const key of keys) {
-      if ((this.#hookHandlers.get(key)?.size ?? 0) > 0)
-        handled = true
-      await this.#hooks.callHook(key, delivered.payload, delivered)
+    try {
+      for (const key of keys) {
+        if ((this.#hookHandlers.get(key)?.size ?? 0) > 0)
+          handled = true
+        await this.#hooks.callHook(key, delivered.payload, delivered)
+      }
+    } catch (error) {
+      // autoAck is at-most-once: the frame is acked whether the handlers
+      // succeeded or not (leaving it unacked would neither retry it — the only
+      // redelivery is on reconnect, where it would be deduped — nor let it go).
+      // For retries, use `autoAck: false` and ack on success only.
+      if (this.#autoAck)
+        ack()
+      throw error
     }
 
     if (!handled) {

@@ -834,6 +834,21 @@ describe('realtimeClient — acknowledgement', () => {
     await rt.close()
   })
 
+  it('autoAck is at-most-once: a frame whose handler threw is still acked (and the error logged)', async () => {
+    MockSocket.reset()
+    const errors: string[] = []
+    const rt = makeRealtime({ logger: { debug() {}, info() {}, warn() {}, error: (m) => errors.push(String(m)) } })
+    rt.alarms.onCreate('*', () => {
+      throw new Error('handler boom')
+    })
+    const socket = await socketFor('c8yRealtimeAlarms')
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'a1' }))
+    await waitFor(() => socket.sent.length >= 1)
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1'])
+    expect(errors.some((m) => /handler threw/.test(m))).toBe(true)
+    await rt.close()
+  })
+
   it('does not auto-ack when autoAck is false', async () => {
     MockSocket.reset()
     const rt = makeRealtime({ autoAck: false })
@@ -917,6 +932,21 @@ describe('realtimeClient — updateCredentials (repair after creds run out)', ()
     await socketFor('c8yRealtimeAlarms')
     expect(rt.healthy).toBe(true)
     expect(rt.ownedSubscriptionIds).toEqual(['sub-c8yRealtimeAlarms'])
+    await rt.close()
+  })
+
+  it('rejects a different tenant or baseUrl before touching anything', async () => {
+    MockSocket.reset()
+    const { fetchImpl, state } = credFetch()
+    state.failTokenStatus = 401
+    const rt = makeCredRealtime(fetchImpl)
+    rt.alarms.onCreate('*', () => {})
+    await waitFor(() => !rt.healthy)
+    await expect(rt.updateCredentials({ baseUrl: 'https://a.com', tenant: 'other', user: 'u', password: 'p2' })).rejects.toThrow(/same tenant and baseUrl/)
+    await expect(rt.updateCredentials({ baseUrl: 'https://b.com', tenant: 't', user: 'u', password: 'p2' })).rejects.toThrow(/same tenant and baseUrl/)
+    expect(state.listAuth.length).toBe(0) // no validation probe ran
+    expect(rt.healthy).toBe(false)
+    await rt.updateCredentials({ baseUrl: 'https://a.com/', tenant: 't', user: 'u', password: 'p2' }) // trailing slash is the same URL
     await rt.close()
   })
 
