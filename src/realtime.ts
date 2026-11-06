@@ -457,11 +457,23 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
    */
   deleteSubscriptionOnEmpty?: boolean
   /**
-   * Delete **every** subscription resource this client created when {@link
-   * RealtimeClient.close} is called. Useful for ephemeral/test clients so they
-   * leave nothing behind. Defaults to `false`.
+   * Delete every subscription resource **this client created** when {@link
+   * RealtimeClient.close} is called. Defaults to `false`.
+   *
+   * A subscription that already existed and was adopted via 409 — e.g. left by
+   * an earlier run with `deleteSubscriptionOnEmpty: false`, or created by
+   * another process using the same `name` — is never deleted by this client
+   * (not here, not on empty, not by {@link RealtimeClient.unsubscribe}). To
+   * clean those up, delete them by id via {@link RealtimeClient.subscriptions}.
    */
   deleteSubscriptionsOnClose?: boolean
+  /**
+   * How long {@link RealtimeClient.close} waits, when `deleteSubscriptionsOnClose`
+   * is on, for in-flight subscription creates/deletes to settle before deleting
+   * (so a late create is deleted rather than leaked). A stalled request cannot
+   * hang shutdown beyond this. Defaults to `5000` ms.
+   */
+  closeSettleTimeoutMs?: number
 }
 
 const WILDCARD = '*'
@@ -596,10 +608,12 @@ export class RealtimeClient {
   readonly #dedupe: boolean
   readonly #deleteSubscriptionOnEmpty: boolean
   readonly #deleteSubscriptionsOnClose: boolean
+  readonly #closeSettleTimeoutMs: number
 
-  // One single-type subscription per `${type}#${scope}`; the value resolves to
-  // its remote id (for deletion). `topicKey` is a notification type, or '*' for onAny.
-  readonly #subs = new Map<string, Promise<string | undefined>>()
+  // One single-type subscription per `${topicKey}#${scope}`; the value resolves
+  // to its remote id plus whether THIS client created it (only then may it be
+  // deleted). `topicKey` is a notification type, '*' for onAny, or `type~hash`.
+  readonly #subs = new Map<string, Promise<{ id: string | undefined, created: boolean } | undefined>>()
   // In-flight remote deletes per subKey. A re-subscribe waits for the pending
   // delete to finish before recreating, so delete and create never race.
   readonly #pendingDeletes = new Map<string, Promise<void>>()
@@ -623,6 +637,9 @@ export class RealtimeClient {
   readonly #topicKeys = new Set<string>()
   readonly #topicStarted = new Set<string>()
   readonly #topicConsumers = new Map<string, () => Promise<void>>()
+  // In-flight consumer closes per topicKey. A re-open of the same topic waits
+  // for the pending close, so two sockets never share one subscriber name.
+  readonly #pendingCloses = new Map<string, () => Promise<void>>()
   // Topics whose consumer ended on its own (fatal error — e.g. revoked creds),
   // NOT via an intentional close. Drained by updateCredentials to restart them.
   readonly #stoppedTopics = new Set<string>()
@@ -654,6 +671,7 @@ export class RealtimeClient {
     this.#dedupe = options.dedupe ?? true
     this.#deleteSubscriptionOnEmpty = options.deleteSubscriptionOnEmpty ?? true
     this.#deleteSubscriptionsOnClose = options.deleteSubscriptionsOnClose ?? false
+    this.#closeSettleTimeoutMs = options.closeSettleTimeoutMs ?? 5000
 
     this.alarms = this.#dualNamespace<Alarm>('alarms')
     this.events = this.#dualNamespace<C8yEvent>('events')
@@ -679,7 +697,12 @@ export class RealtimeClient {
   }
 
   /**
-   * The subscription resource ids this client has created (for diagnostics).
+   * The ids of the subscription resources this client **created and still
+   * holds** (for diagnostics, and what `deleteSubscriptionsOnClose` deletes).
+   * An id is dropped once the client deletes it. A subscription that already
+   * existed and was adopted via 409 — e.g. created by another process with the
+   * same `name`, or by an earlier run with `deleteSubscriptionOnEmpty: false` —
+   * is not listed: it is not this client's to delete.
    */
   get ownedSubscriptionIds(): readonly string[] {
     return this.#ownedSubscriptionIds
@@ -759,8 +782,9 @@ export class RealtimeClient {
    *
    * **Always** deletes the underlying single-type subscription once removing
    * these handlers leaves the `(type, scope)` with none (regardless of the
-   * `deleteSubscriptionOnEmpty` option) — and closes the type's consumer if that
-   * was its last scope. Note the subscription is shared across a `(type, scope)`'s
+   * `deleteSubscriptionOnEmpty` option) — provided this client created it; an
+   * adopted one (409) is only forgotten, never deleted. Closes the type's
+   * consumer if that was its last scope. Note the subscription is shared across a `(type, scope)`'s
    * actions: `unsubscribe('alarms:create:*')` won't delete the remote while
    * `alarms:update:*` still has a handler. Use {@link detach} to remove handlers
    * but keep the subscription.
@@ -956,10 +980,20 @@ export class RealtimeClient {
    */
   async close(): Promise<void> {
     this.#closing = true
-    await Promise.all([...this.#topicConsumers.values()].map((close) => close()))
+    await Promise.all([...this.#topicConsumers.values(), ...this.#pendingCloses.values()].map((close) => close()))
     if (this.#deleteSubscriptionsOnClose) {
-      await Promise.all(this.#ownedSubscriptionIds.map((id) =>
-        this.#client.subscriptions.delete(id).catch(() => {})))
+      // Let in-flight creates land (so they can be deleted, not leaked) and
+      // in-flight deletes finish (so nothing is deleted twice) — but never let a
+      // stalled request hang shutdown.
+      const settle = Promise.all([...this.#subs.values(), ...this.#pendingDeletes.values()])
+      await Promise.race([settle, new Promise<void>((resolve) => {
+        setTimeout(resolve, this.#closeSettleTimeoutMs).unref?.()
+      })])
+      const ids = [...new Set(this.#ownedSubscriptionIds)]
+      await Promise.all(ids.map(async (id) => {
+        await this.#client.subscriptions.delete(id).catch(() => {})
+        this.#forgetOwned(id)
+      }))
     }
     await this.#client.close()
   }
@@ -1130,13 +1164,26 @@ export class RealtimeClient {
     // create could land first and this delete would then remove it, leaving the
     // client silently unsubscribed.
     const done: Promise<void> = Promise.resolve(idPromise)
-      .then((id) => (id ? this.#client.subscriptions.delete(id).catch(() => {}) : undefined))
+      .then(async (sub) => {
+        // Never delete a subscription this client did not create (adopted via
+        // 409): it may belong to another process using the same `name`.
+        if (!sub?.id || !sub.created)
+          return
+        await this.#client.subscriptions.delete(sub.id).catch(() => {})
+        this.#forgetOwned(sub.id)
+      })
       .catch(() => {})
       .finally(() => {
         if (this.#pendingDeletes.get(subKey) === done)
           this.#pendingDeletes.delete(subKey)
       })
     this.#pendingDeletes.set(subKey, done)
+  }
+
+  #forgetOwned(id: string): void {
+    const at = this.#ownedSubscriptionIds.indexOf(id)
+    if (at !== -1)
+      this.#ownedSubscriptionIds.splice(at, 1)
   }
 
   /**
@@ -1152,8 +1199,15 @@ export class RealtimeClient {
     // The topic is being intentionally removed — never let a prior unexpected
     // stop resurrect it on the next updateCredentials.
     this.#stoppedTopics.delete(topicKey)
-    if (close)
-      close().catch(() => {})
+    if (!close)
+      return
+    const done = close().catch(() => {})
+    const pending = (): Promise<void> => done
+    this.#pendingCloses.set(topicKey, pending)
+    done.then(() => {
+      if (this.#pendingCloses.get(topicKey) === pending)
+        this.#pendingCloses.delete(topicKey)
+    }).catch(() => {})
   }
 
   /**
@@ -1222,11 +1276,14 @@ export class RealtimeClient {
     // finish before creating, so the create can't be undone by the late delete.
     const pending = this.#pendingDeletes.get(key)
     const promise = (pending ?? Promise.resolve())
-      .then(() => this.#client.subscriptions.ensure(subscription))
-      .then((created) => {
-        if (created.id)
-          this.#ownedSubscriptionIds.push(created.id)
-        return created.id
+      .then(() => this.#client.subscriptions.ensureDetailed(subscription))
+      .then(({ created, subscription: sub }) => {
+        // Only a subscription this call created is ours to delete (on empty or
+        // on close); one adopted via 409 may belong to another process using
+        // the same `name`.
+        if (created && sub.id)
+          this.#ownedSubscriptionIds.push(sub.id)
+        return { id: sub.id, created }
       })
       .catch((error) => {
         if (!this.#closing)
@@ -1260,20 +1317,37 @@ export class RealtimeClient {
     if (this.#topicStarted.has(topicKey))
       return
     this.#topicStarted.add(topicKey)
+    // If this topic's previous consumer is still closing (remove-last-handler
+    // then an immediate re-register), open the new one only once it is gone —
+    // otherwise two sockets would briefly compete under one subscriber name.
+    const pending = this.#pendingCloses.get(topicKey)
+    if (!pending) {
+      this.#openConsumer(topicKey)
+      return
+    }
+    pending().then(() => {
+      // Still wanted? (It may have been torn down again, or the client closed.)
+      if (this.#topicStarted.has(topicKey) && !this.#topicConsumers.has(topicKey) && !this.#closing)
+        this.#openConsumer(topicKey)
+    }).catch(() => {})
+  }
+
+  #openConsumer(topicKey: string): void {
     const name = this.#topicName(topicKey)
     const consumer = this.#client.subscribe(name, {
       subscriber: `${name}Consumer`,
       autoAck: false,
       nonPersistent: this.#nonPersistent,
     })
-    this.#topicConsumers.set(topicKey, () => consumer.close())
-    this.#pump(topicKey, consumer).catch((error) => {
+    const close = (): Promise<void> => consumer.close()
+    this.#topicConsumers.set(topicKey, close)
+    this.#pump(topicKey, consumer, close).catch((error) => {
       if (!this.#closing)
         this.#logger.error(`realtime consumer pump failed for ${name}`, error)
     })
   }
 
-  async #pump(topicKey: string, consumer: AsyncIterable<Notification>): Promise<void> {
+  async #pump(topicKey: string, consumer: AsyncIterable<Notification>, close: () => Promise<void>): Promise<void> {
     for await (const notification of consumer) {
       try {
         await this.#dispatch(topicKey, notification)
@@ -1285,7 +1359,10 @@ export class RealtimeClient {
     // close()) clears #topicStarted first, or sets #closing — so if the topic is
     // still started and we are not closing, it stopped on its own (a fatal error
     // such as revoked credentials). Mark it for updateCredentials to restart.
-    if (!this.#closing && this.#topicStarted.has(topicKey)) {
+    // `close` identity guards against a stale pump: if the topic was torn down
+    // and re-opened meanwhile, the registered consumer is a different one and
+    // this ending is not an unexpected stop.
+    if (!this.#closing && this.#topicStarted.has(topicKey) && this.#topicConsumers.get(topicKey) === close) {
       this.#stoppedTopics.add(topicKey)
       this.#logger.warn(`realtime: consumer for ${this.#topicName(topicKey)} stopped unexpectedly (call updateCredentials to restart it)`)
     }

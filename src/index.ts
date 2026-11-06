@@ -37,6 +37,7 @@ export { createToken, SubscriptionsApi, unsubscribeConsumer } from './subscripti
 export { SubscriptionApis } from './types'
 
 export type { ConsumerConfig } from './consumer'
+export type { EnsureResult } from './subscriptions'
 export type {
   Alarm,
   AlarmSeverity,

@@ -123,7 +123,7 @@ Required: `name` (unique per app, alphanumeric), plus `baseUrl`, `tenant`, `user
 | Option                       | Default | What It Does                                                                                                                                                          |
 | ---------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `deleteSubscriptionOnEmpty`  | `true`  | Delete a device's remote subscription when its last handler is gone.                                                                                                  |
-| `deleteSubscriptionsOnClose` | `false` | Delete every subscription this client created on `close()`.                                                                                                           |
+| `deleteSubscriptionsOnClose` | `false` | On `close()`, delete every subscription this client created (not ones it found already existing, which may belong to another process with the same `name`).           |
 | `autoAck`                    | `true`  | Acknowledge each message after its handlers finish. Off: you call `n.ack()`. Frames the client drops itself (duplicates, no handler, out-of-filter) are always acked. |
 | `autoStart`                  | `true`  | Connect as soon as handlers are registered.                                                                                                                           |
 | `ensureSubscription`         | `true`  | Create the subscription on the platform if missing.                                                                                                                   |
@@ -232,7 +232,7 @@ for await (const n of consumer) {
 await client.close()
 ```
 
-- `client.subscriptions`: `list`, `get`, `create`, `ensure` (409 = already exists), `delete` (404 = already gone).
+- `client.subscriptions`: `list`, `get`, `create`, `ensure` (409 = already exists), `ensureDetailed` (same, plus `created: boolean`), `delete` (404 = already gone).
 - `client.subscribe(name, options?)`: async-iterable consumer. Options: `subscriber`, `autoAck` (default `true`), `nonPersistent`, `shared`, `expiresInMinutes`, `consumerName`, `signal`. Set `autoAck: false` and call `n.ack()` yourself for at-least-once.
 - `client.close()` closes every consumer.
 

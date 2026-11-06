@@ -748,6 +748,121 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
     await rt.close()
   })
 
+  it('re-registering while the old consumer is still closing opens the new socket only afterwards, and stays healthy', async () => {
+    MockSocket.reset()
+    const { rt } = lifecycleClient({ autoStart: true })
+    const off = rt.alarms.onCreate('111', () => {})
+    const first = await socketFor('c8yRealtimeAlarms')
+    off() // last handler → consumer close starts (the socket closes on a microtask)
+    rt.alarms.onCreate('111', () => {}) // immediate re-register
+    expect(MockSocket.instances).toHaveLength(1) // no second socket while the first is still open
+    await waitFor(() => MockSocket.instances.length === 2)
+    expect(first.closedWith).toBeDefined()
+    const second = MockSocket.instances[1]!
+    second.emit('open')
+    await delay(30)
+    expect(rt.healthy).toBe(true) // the old pump ending is not an "unexpected stop"
+    expect(rt.hookKeys()).toEqual(['alarms:create:111'])
+    await rt.close()
+  })
+
+  it('owns only subscriptions it created: an adopted (409) one is not deleted on close', async () => {
+    MockSocket.reset()
+    const deleted: string[] = []
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string }) => {
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? JSON.parse(init.body) as { subscription?: string, source?: { id: string } } : {}
+      if (url.includes('notification2/token'))
+        return json({ token: `tok-${body.subscription}` })
+      if (url.includes('notification2/subscriptions/') && method === 'DELETE') {
+        deleted.push(url.split('/').pop()!)
+        return new Response(null, { status: 204 })
+      }
+      if (url.includes('notification2/subscriptions') && method === 'POST')
+        return body.source?.id === '111' ? json({ error: 'exists' }, 409) : json({ id: 'mine', ...body }, 201)
+      return json({ subscriptions: [{ id: 'foreign', subscription: 'c8yRealtimeAlarms', context: 'mo', source: { id: '111' } }] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false, deleteSubscriptionsOnClose: true })
+    rt.alarms.onCreate('111', () => {}) // adopted via 409
+    rt.alarms.onCreate('222', () => {}) // created
+    await rt.start()
+    expect(rt.ownedSubscriptionIds).toEqual(['mine'])
+    await rt.close()
+    expect(deleted).toEqual(['mine'])
+  })
+
+  it('delete-on-empty and unsubscribe() never delete an adopted (409) subscription; owned ids drop on delete', async () => {
+    MockSocket.reset()
+    const deleted: string[] = []
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string }) => {
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? JSON.parse(init.body) as { subscription?: string, source?: { id: string } } : {}
+      if (url.includes('notification2/token'))
+        return json({ token: `tok-${body.subscription}` })
+      if (url.includes('notification2/subscriptions/') && method === 'DELETE') {
+        deleted.push(url.split('/').pop()!)
+        return new Response(null, { status: 204 })
+      }
+      if (url.includes('notification2/subscriptions') && method === 'POST')
+        return body.source?.id === '111' ? json({ error: 'exists' }, 409) : json({ id: `mine-${body.source?.id}`, ...body }, 201)
+      return json({ subscriptions: [{ id: 'foreign', subscription: 'c8yRealtimeAlarms', context: 'mo', source: { id: '111' } }] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false })
+    const offAdopted = rt.alarms.onCreate('111', () => {})
+    rt.alarms.onCreate('222', () => {})
+    await rt.start()
+    expect(rt.ownedSubscriptionIds).toEqual(['mine-222'])
+    offAdopted() // delete-on-empty on the adopted one → forgotten, NOT deleted
+    await delay(10)
+    expect(deleted).toEqual([])
+    rt.alarms.onCreate('111', () => {})
+    await rt.start()
+    expect(rt.unsubscribe('alarms:create:111')).toMatchObject({ removed: true, count: 1 }) // explicit unsubscribe: same rule
+    await delay(10)
+    expect(deleted).toEqual([])
+    expect(rt.unsubscribe('alarms:create:222')).toMatchObject({ removed: true, count: 1, subscriptionDeleted: true })
+    await delay(10)
+    expect(deleted).toEqual(['mine-222'])
+    expect(rt.ownedSubscriptionIds).toEqual([]) // dropped once deleted
+    await rt.close()
+  })
+
+  it('close() with deleteSubscriptionsOnClose does not hang on a stalled create (bounded settle wait)', async () => {
+    MockSocket.reset()
+    const fetchImpl = (async (url: string, init?: { method?: string }) => {
+      if (url.includes('notification2/subscriptions') && init?.method === 'POST')
+        return new Promise<Response>(() => {}) // never resolves
+      return json({ subscriptions: [] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false, deleteSubscriptionsOnClose: true, closeSettleTimeoutMs: 30 })
+    rt.alarms.onCreate('111', () => {})
+    const started = Date.now()
+    await rt.close()
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
+  it('close() with deleteSubscriptionsOnClose waits for an in-flight create so it is deleted, not leaked', async () => {
+    MockSocket.reset()
+    const deleted: string[] = []
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string }) => {
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? JSON.parse(init.body) as { subscription?: string } : {}
+      if (url.includes('notification2/subscriptions/') && method === 'DELETE') {
+        deleted.push(url.split('/').pop()!)
+        return new Response(null, { status: 204 })
+      }
+      if (url.includes('notification2/subscriptions') && method === 'POST') {
+        await delay(30) // slow create
+        return json({ id: 'late', ...body }, 201)
+      }
+      return json({ subscriptions: [] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false, deleteSubscriptionsOnClose: true })
+    rt.alarms.onCreate('111', () => {})
+    await rt.close() // create still in flight
+    expect(deleted).toEqual(['late'])
+  })
+
   it('removes a single handler by unique label; reports removed + subscriptionDeleted', () => {
     MockSocket.reset()
     const { rt } = lifecycleClient()
