@@ -1,7 +1,7 @@
 /**
  * High-level, ergonomic, strongly-typed realtime client for Cumulocity
  * Notification 2.0 — built on top of the framework-agnostic core
- * ({@link createNotificationClient}) and powered by `hookable`.
+ * ({@link createNotificationClient}).
  *
  * Two registration surfaces, both fully typed and both taking an **explicit
  * scope + a handler** (+ an optional unique label). The scope is always
@@ -55,7 +55,6 @@
  * topics; cancelling one never touches the other. The cost is one websocket per
  * filter group. There is still no `fragmentsToCopy`.
  */
-import { createHooks } from 'hookable'
 import { createNotificationClient } from './client'
 import { normalizeBaseUrl } from './http'
 import type { NotificationClient } from './client'
@@ -419,7 +418,8 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
    * redelivered on every reconnect.
    *
    * `true` is **at-most-once**: the frame is acked after its handlers finish,
-   * even if one of them threw (the error is logged). `false` is
+   * even if one of them threw (the error is logged; the other handlers for the
+   * frame still run). `false` is
    * **at-least-once**: ack on success only; a frame you have not acked is
    * redelivered by the platform when the connection is re-established (there
    * is no nack / on-demand redelivery in Notification 2.0), and your handlers
@@ -468,10 +468,11 @@ export interface RealtimeClientOptions extends NotificationClientOptions {
    */
   deleteSubscriptionsOnClose?: boolean
   /**
-   * How long {@link RealtimeClient.close} waits, when `deleteSubscriptionsOnClose`
-   * is on, for in-flight subscription creates/deletes to settle before deleting
-   * (so a late create is deleted rather than leaked). A stalled request cannot
-   * hang shutdown beyond this. Defaults to `5000` ms.
+   * How long {@link RealtimeClient.close} waits for in-flight work: handlers
+   * still running (so their acks land on the live socket instead of the frame
+   * being reprocessed next run) and, with `deleteSubscriptionsOnClose`, pending
+   * subscription creates/deletes (so a late create is deleted rather than
+   * leaked). Nothing stalled can hang shutdown beyond this. Defaults to `5000` ms.
    */
   closeSettleTimeoutMs?: number
 }
@@ -546,7 +547,7 @@ export function toRealtimeName(raw: string): string {
 /**
  * One registered handler's bookkeeping. `subKey` (`${type}#${scope}`) identifies
  * the shared single-type subscription; `hookKey` (`${scope}#${type}:${action}`)
- * identifies the hookable bucket it fires from.
+ * identifies the dispatch bucket it fires from.
  */
 interface HandlerEntry {
   hookKey: string
@@ -554,7 +555,7 @@ interface HandlerEntry {
   type: string
   scope: string
   label: string | undefined
-  unhook: () => void
+  handler: NotificationHandler<unknown>
   removed: boolean
 }
 
@@ -572,7 +573,8 @@ interface HandlerEntry {
  * distinct types used, not the number of devices.
  *
  * Handlers registered under the same key fire **sequentially**, in registration
- * order, each awaited before the next — matching `hookable`'s serial `callHook`.
+ * order, each awaited before the next. A throwing handler never prevents its
+ * siblings from running; its error is logged.
  */
 export class RealtimeClient {
   /**
@@ -597,7 +599,6 @@ export class RealtimeClient {
   readonly operations: TypeHooks<Operation>
 
   readonly #client: NotificationClient
-  readonly #hooks = createHooks()
   readonly #logger: Logger
   readonly #base: string
   readonly #apis: SubscriptionApi[]
@@ -632,6 +633,10 @@ export class RealtimeClient {
   // Filter groups by topicKey (`<type>~<hash>`), for topic naming, the
   // typeFilter on each subscription, the dispatch guard and public keys.
   readonly #filterGroups = new Map<string, FilterGroup>()
+
+  // Dispatches currently running (a handler is mid-flight). close() waits for
+  // them (bounded) so their acks land on the still-open socket.
+  readonly #inflight = new Set<Promise<void>>()
 
   // One consumer per topicKey (per type, per (type, filter group), + '*' for onAny).
   readonly #topicKeys = new Set<string>()
@@ -980,15 +985,16 @@ export class RealtimeClient {
    */
   async close(): Promise<void> {
     this.#closing = true
+    // Let handlers that are mid-flight finish (bounded) so their acks are sent
+    // on the live socket; otherwise those frames are reprocessed on the next run.
+    if (this.#inflight.size > 0)
+      await this.#settle(Promise.all([...this.#inflight]))
     await Promise.all([...this.#topicConsumers.values(), ...this.#pendingCloses.values()].map((close) => close()))
     if (this.#deleteSubscriptionsOnClose) {
       // Let in-flight creates land (so they can be deleted, not leaked) and
       // in-flight deletes finish (so nothing is deleted twice) — but never let a
       // stalled request hang shutdown.
-      const settle = Promise.all([...this.#subs.values(), ...this.#pendingDeletes.values()])
-      await Promise.race([settle, new Promise<void>((resolve) => {
-        setTimeout(resolve, this.#closeSettleTimeoutMs).unref?.()
-      })])
+      await this.#settle(Promise.all([...this.#subs.values(), ...this.#pendingDeletes.values()]))
       const ids = [...new Set(this.#ownedSubscriptionIds)]
       await Promise.all(ids.map(async (id) => {
         await this.#client.subscriptions.delete(id).catch(() => {})
@@ -1039,10 +1045,7 @@ export class RealtimeClient {
     const topicKey = types ? this.#filterTopicKey(type, types) : type
     const hookKey = `${scope}#${topicKey}:${action}`
     const subKey = `${topicKey}#${scope}`
-    const wrapped = (payload: unknown, notification: Notification<unknown>): void | Promise<void> =>
-      handler(payload, notification)
-    const unhook = this.#hooks.hook(hookKey, wrapped as never)
-    const entry: HandlerEntry = { hookKey, subKey, type: topicKey, scope, label, unhook, removed: false }
+    const entry: HandlerEntry = { hookKey, subKey, type: topicKey, scope, label, handler, removed: false }
 
     let set = this.#hookHandlers.get(hookKey)
     if (!set) {
@@ -1097,7 +1100,7 @@ export class RealtimeClient {
   }
 
   /**
-   * Remove one handler from hookable + all bookkeeping. Returns `true` if this
+   * Remove one handler from dispatch + all bookkeeping. Returns `true` if this
    * call removed it (idempotent — `false` if already removed).
    * @param entry
    */
@@ -1105,7 +1108,6 @@ export class RealtimeClient {
     if (entry.removed)
       return false
     entry.removed = true
-    entry.unhook()
     const set = this.#hookHandlers.get(entry.hookKey)
     set?.delete(entry)
     if (set && set.size === 0)
@@ -1178,6 +1180,16 @@ export class RealtimeClient {
           this.#pendingDeletes.delete(subKey)
       })
     this.#pendingDeletes.set(subKey, done)
+  }
+
+  /**
+   * Await `work`, but never longer than `closeSettleTimeoutMs`.
+   * @param work
+   */
+  async #settle(work: Promise<unknown>): Promise<void> {
+    await Promise.race([work, new Promise<void>((resolve) => {
+      setTimeout(resolve, this.#closeSettleTimeoutMs).unref?.()
+    })])
   }
 
   #forgetOwned(id: string): void {
@@ -1349,10 +1361,14 @@ export class RealtimeClient {
 
   async #pump(topicKey: string, consumer: AsyncIterable<Notification>, close: () => Promise<void>): Promise<void> {
     for await (const notification of consumer) {
+      const run = this.#dispatch(topicKey, notification).catch((error) => {
+        this.#logger.error('realtime: dispatch failed', error)
+      })
+      this.#inflight.add(run)
       try {
-        await this.#dispatch(topicKey, notification)
-      } catch (error) {
-        this.#logger.error('notification handler threw', error)
+        await run
+      } finally {
+        this.#inflight.delete(run)
       }
     }
     // The consumer's run loop ended. An intentional teardown (#closeConsumer /
@@ -1424,22 +1440,28 @@ export class RealtimeClient {
           `${source}#${routeType}:${WILDCARD}`,
           `${WILDCARD}#${routeType}:${WILDCARD}`,
         ])
+    // Run every matching handler in registration order, each awaited before the
+    // next. A throwing handler never skips its siblings: they may be unrelated
+    // consumers of the same event. Errors are collected and logged afterwards.
     let handled = false
-    try {
-      for (const key of keys) {
-        if ((this.#hookHandlers.get(key)?.size ?? 0) > 0)
-          handled = true
-        await this.#hooks.callHook(key, delivered.payload, delivered)
+    const errors: unknown[] = []
+    for (const key of keys) {
+      const set = this.#hookHandlers.get(key)
+      if (!set || set.size === 0)
+        continue
+      handled = true
+      for (const entry of [...set]) {
+        if (entry.removed)
+          continue
+        try {
+          await entry.handler(delivered.payload, delivered)
+        } catch (error) {
+          errors.push(error)
+        }
       }
-    } catch (error) {
-      // autoAck is at-most-once: the frame is acked whether the handlers
-      // succeeded or not (leaving it unacked would neither retry it — the only
-      // redelivery is on reconnect, where it would be deduped — nor let it go).
-      // For retries, use `autoAck: false` and ack on success only.
-      if (this.#autoAck)
-        ack()
-      throw error
     }
+    for (const error of errors)
+      this.#logger.error(`realtime: notification handler threw for ${type}:${action} (source ${source})`, error)
 
     if (!handled) {
       // Same as a duplicate: nothing was delivered, so ack unconditionally.

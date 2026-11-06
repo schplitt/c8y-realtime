@@ -949,6 +949,32 @@ describe('realtimeClient — acknowledgement', () => {
     await rt.close()
   })
 
+  it('a throwing handler never skips its siblings — same key, other scope, and onAny all still run', async () => {
+    MockSocket.reset()
+    const errors: string[] = []
+    const rt = makeRealtime({ logger: { debug() {}, info() {}, warn() {}, error: (m) => errors.push(String(m)) } })
+    const ran: string[] = []
+    rt.alarms.onCreate('*', () => {
+      throw new Error('first boom')
+    })
+    rt.alarms.onCreate('*', () => {
+      ran.push('sibling-same-key')
+    })
+    rt.alarms.onCreate('1', () => {
+      ran.push('device-scoped')
+    })
+    rt.alarms.onAny('*', () => {
+      ran.push('type-onAny')
+    })
+    const socket = await socketFor('c8yRealtimeAlarms')
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'a1' }))
+    await waitFor(() => socket.sent.length >= 1)
+    expect(ran.sort()).toEqual(['device-scoped', 'sibling-same-key', 'type-onAny'])
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1']) // still acked (autoAck)
+    expect(errors.filter((m) => /handler threw/.test(m))).toHaveLength(1)
+    await rt.close()
+  })
+
   it('autoAck is at-most-once: a frame whose handler threw is still acked (and the error logged)', async () => {
     MockSocket.reset()
     const errors: string[] = []
@@ -977,6 +1003,40 @@ describe('realtimeClient — acknowledgement', () => {
     await delay(20)
     expect(socket.sent).toEqual([])
     await rt.close()
+  })
+})
+
+describe('realtimeClient — close() drains in-flight handlers', () => {
+  it('waits for a running handler so its ack lands on the live socket', async () => {
+    MockSocket.reset()
+    const rt = makeRealtime()
+    let release!: () => void
+    rt.alarms.onCreate('*', () => new Promise<void>((resolve) => {
+      release = resolve
+    }))
+    const socket = await socketFor('c8yRealtimeAlarms')
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'a1' }))
+    await delay(5) // handler is now mid-flight
+    const closing = rt.close()
+    await delay(20)
+    expect(socket.closedWith).toBeUndefined() // not closed while the handler runs
+    release()
+    await closing
+    expect(socket.sent).toEqual(['ACK-alarms-CREATE-1']) // acked before the socket went down
+    expect(socket.closedWith).toBeDefined()
+  })
+
+  it('does not wait longer than closeSettleTimeoutMs for a handler that never finishes', async () => {
+    MockSocket.reset()
+    const rt = makeRealtime({ closeSettleTimeoutMs: 30 })
+    rt.alarms.onCreate('*', () => new Promise<void>(() => {}))
+    const socket = await socketFor('c8yRealtimeAlarms')
+    socket.emit('message', frame('alarms', 'CREATE', '1', { id: 'a1' }))
+    await delay(5)
+    const started = Date.now()
+    await rt.close()
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(socket.sent).toEqual([]) // never acked: it is reprocessed next run, by design
   })
 })
 

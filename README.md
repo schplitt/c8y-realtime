@@ -3,7 +3,7 @@
 A small, typed TypeScript SDK for **Cumulocity Notification 2.0** realtime streams.
 
 - Typed handlers per type, action, and device: `rt.alarms.onCreate('12345', (a) => …)`.
-- Native `fetch` and the runtime's global `WebSocket`. No `@c8y/client`, no `ws`.
+- Zero runtime dependencies: native `fetch` and the runtime's global `WebSocket`. No `@c8y/client`, no `ws`.
 - Token, connection, keep-alive, reconnect, and de-duplication are handled for you.
 - ESM only, strict TypeScript, Node ≥ 22 (or any runtime with a global `WebSocket`).
 
@@ -177,7 +177,7 @@ await client.close()
 - **No changing a live subscription.** Cumulocity has no in-place update, only delete + recreate: delete→create drops messages in the gap, create→delete double-delivers. So the client never edits a subscription after creating it. A type filter is part of a subscription's identity (its own topic); removing the last handler deletes it, and a new registration creates a fresh one.
 - **No options object beyond `{ source, type }`.** Both scope forms map to one string key, so everything you register can be listed, checked, and removed by key.
 - **Scoped `onAny` can't be removed by key.** `rt.onAny(fn)` has the key `'*'` (`rt.hook('*', fn)`, `hasHook('*')`, `unsubscribe('*')`, listed by `hookKeys()`). A scoped firehose (`rt.onAny(deviceId, fn)`) or a per-type one (`rt.alarms.onAny(…)`) spans all actions and has no key; remove those with the returned function or by `label`.
-- **Handlers on the same key run one after another**, in registration order, each awaited before the next.
+- **Handlers on the same key run one after another**, in registration order, each awaited before the next. One throwing handler doesn't stop the others; its error is logged.
 
 ## Development
 

@@ -177,7 +177,7 @@ Guidelines:
 
 ## Current Prototype Notes
 
-The current codebase exposes a hook-based `RealtimeClient` built on `hookable`.
+The current codebase exposes a hook-based `RealtimeClient` (its own dispatch; no `hookable`).
 
 That is acceptable as a temporary scaffold, but future work should prefer:
 
@@ -421,7 +421,7 @@ This section captures project-specific knowledge, tool quirks, and lessons learn
 
 ### Tools & Dependencies
 
-- The package should stay lightweight and avoid unnecessary runtime dependencies in the core realtime implementation. Runtime deps: `hookable` (high-level dispatch) only; the consumer uses the runtime's global `WebSocket` (injectable).
+- The package should stay lightweight and avoid unnecessary runtime dependencies in the core realtime implementation. Runtime deps: **none**. The consumer uses the runtime's global `WebSocket` (injectable); the high-level client dispatches handlers itself (every matching handler runs, serially, even if a sibling throws).
 - CI runs build, unit tests, lint, and typecheck on pull requests; keep local verification aligned with that.
 - Release publishing is tag-driven through GitHub Actions and npm.
 
