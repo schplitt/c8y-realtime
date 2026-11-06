@@ -9,13 +9,13 @@ trustPolicyExclude:
   - undici-types@6.21.0
 
 catalog:
-  '@schplitt/eslint-config': ^1.5.0
-  '@types/node': ^24.12.3
-  bumpp: ^11.1.0
-  eslint: ^10.3.0
-  tsdown: ^0.22.0
+  '@schplitt/eslint-config': ^1.5.4
+  '@types/node': ^26.6.6
+  bumpp: ^12.3.0
+  eslint: ^10.14.0
+  tsdown: ^0.23.5
   typescript: ^6.0.3
-  vitest: ^4.1.5
+  vitest: ^5.1.0
 onlyBuiltDependencies:
   - esbuild
 allowBuilds:

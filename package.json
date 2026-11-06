@@ -2,7 +2,7 @@
   "name": "c8y-realtime",
   "version": "0.2.2",
   "type": "module",
-  "packageManager": "pnpm@11.0.9",
+  "packageManager": "pnpm@12.18.0",
   "description": "A Web API compatible real-time client for Cumulocity IoT with hook-based event subscriptions",
   "keywords": [
     "cumulocity",
@@ -48,8 +48,7 @@
     "test:unit": "vitest run tests/unit",
     "test:e2e": "vitest run tests/e2e"
   },
-  "dependencies": {
-  },
+  "dependencies": {},
   "devDependencies": {
     "@schplitt/eslint-config": "catalog:",
     "@types/node": "catalog:",
