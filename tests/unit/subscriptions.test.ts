@@ -78,6 +78,37 @@ describe('subscriptionsApi.ensureDetailed', () => {
     expect(second.created).toBe(false)
     expect(second.subscription.id).toBe('1')
   })
+
+  it('adopts a tenant subscription whose source the platform filled in when the request has none', async () => {
+    const existing: SubscriptionResponse = {
+      id: '42',
+      self: 'https://a.com/notification2/subscriptions/42',
+      context: 'tenant',
+      subscription: 'demo',
+      source: { self: 'https://a.com/inventory/managedObjects/t123', id: 't123' } as SubscriptionResponse['source'],
+      subscriptionFilter: { apis: ['alarms'] },
+    }
+    const { api } = makeApi((method) => method === 'POST'
+      ? jsonResponse({ error: 'reliable-notification/Duplicate', message: 'Subscription demo already exists!' }, 409)
+      : jsonResponse({ subscriptions: [existing] }))
+    const result = await api.ensureDetailed({ context: 'tenant', subscription: 'demo', subscriptionFilter: { apis: ['alarms'] } })
+    expect(result).toEqual({ created: false, subscription: existing })
+    expect(result.subscription.id).toBe('42')
+  })
+
+  it('throws a plain 409 instead of returning the error body when no existing subscription matches', async () => {
+    const errorBody = {
+      error: 'reliable-notification/Duplicate',
+      message: 'Subscription demo already exists!',
+      info: 'https://example.com/docs',
+    }
+    const { api } = makeApi((method) => method === 'POST'
+      ? jsonResponse(errorBody, 409)
+      : jsonResponse({ subscriptions: [] }))
+    const error = await api.ensureDetailed({ context: 'tenant', subscription: 'demo' }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(C8yHttpError)
+    expect((error as C8yHttpError).status).toBe(409)
+  })
 })
 
 describe('subscriptionsApi.ensureDetailed — existing subscription mismatch', () => {
@@ -158,6 +189,30 @@ describe('subscriptionsApi.ensureDetailed — existing subscription mismatch', (
     expect(error).not.toBeInstanceOf(C8ySubscriptionMismatchError)
     expect(error).toBeInstanceOf(C8yHttpError)
     expect((error as C8yHttpError).status).toBe(409)
+  })
+
+  it('does not adopt another device\'s mo subscription for a source-less mo request: plain 409', async () => {
+    const existing: SubscriptionResponse = { id: 'other', context: 'mo', subscription: 'demo', source: { id: '999' } }
+    const { api } = makeApi((method) => method === 'POST' ? new Response('', { status: 409 }) : jsonResponse({ subscriptions: [existing] }))
+    const error = await api.ensureDetailed({ context: 'mo', subscription: 'demo' }).catch((e: unknown) => e)
+    expect(error).not.toBeInstanceOf(C8ySubscriptionMismatchError)
+    expect(error).toBeInstanceOf(C8yHttpError)
+    expect((error as C8yHttpError).status).toBe(409)
+  })
+
+  it('blames a differing setting, not the platform-filled source, for a source-less tenant request', async () => {
+    const existing: SubscriptionResponse = {
+      id: 'stale',
+      context: 'tenant',
+      subscription: 'demo',
+      source: { id: 't123' },
+      nonPersistent: true,
+    }
+    const error = await conflictWith([existing]).ensureDetailed({ context: 'tenant', subscription: 'demo' }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(C8ySubscriptionMismatchError)
+    const { message } = error as C8ySubscriptionMismatchError
+    expect(message).toContain('nonPersistent')
+    expect(message).not.toContain('source')
   })
 })
 
