@@ -165,7 +165,7 @@ for await (const n of client.subscribe('myDemo', { subscriber: 'myService' })) {
 await client.close()
 ```
 
-- `client.subscriptions`: `list`, `get`, `create`, `ensure` (409 = already exists), `ensureDetailed` (→ `{ created, subscription }`), `delete` (404 = already gone). Names must be alphanumeric.
+- `client.subscriptions`: `list`, `get`, `create`, `ensure` (409 = already exists), `ensureDetailed` (→ `{ created, subscription }`), `delete` (404 = already gone). Names must be alphanumeric. If the existing subscription (same name and source) differs from the requested one (context, `nonPersistent`, `apis`, `typeFilter`, or `fragmentsToCopy`), `ensure` throws `C8ySubscriptionMismatchError` (`existing`, `requested`); delete the existing one to apply the new settings. The realtime client logs this error with the stale subscription id and skips that subscription.
 - `client.subscribe(name, options?)`: async-iterable consumer. Options: `subscriber`, `autoAck` (default `true`), `nonPersistent`, `shared`, `expiresInMinutes`, `consumerName`, `signal`. Set `autoAck: false` and call `n.ack()` yourself for at-least-once.
 - `client.close()` closes every consumer.
 

@@ -56,6 +56,7 @@
  * filter group. There is still no `fragmentsToCopy`.
  */
 import { createNotificationClient } from './client'
+import { C8ySubscriptionMismatchError } from './errors'
 import { normalizeBaseUrl } from './http'
 import type { NotificationClient } from './client'
 import type {
@@ -1264,6 +1265,10 @@ export class RealtimeClient {
    * and — for a filter group — its `typeFilter` is the group's OData expression.
    * It forwards the **full** message (no `fragmentsToCopy`), so any number of
    * handlers can share one `(topicKey, scope)` stream without conflict.
+   * If a same-name subscription already exists with different settings (e.g.
+   * `apis` or `nonPersistent` changed since it was created), ensure throws
+   * {@link C8ySubscriptionMismatchError}: that is logged with the stale id to
+   * delete, and this `(topicKey, scope)` gets no subscription.
    * @param topicKey
    * @param scope
    */
@@ -1298,8 +1303,18 @@ export class RealtimeClient {
         return { id: sub.id, created }
       })
       .catch((error) => {
-        if (!this.#closing)
-          this.#logger.error(`realtime: failed to ensure subscription ${key}`, error)
+        // A same-name subscription with different settings is a setup error:
+        // name the stale one so the caller can delete it.
+        if (!this.#closing) {
+          if (error instanceof C8ySubscriptionMismatchError) {
+            this.#logger.error(
+              `realtime: subscription ${error.existing.id} on topic ${subscription.subscription} (${key}) does not match the requested one; delete it (e.g. client.subscriptions.delete('${error.existing.id}')) so it can be recreated`,
+              error,
+            )
+          } else {
+            this.#logger.error(`realtime: failed to ensure subscription ${key}`, error)
+          }
+        }
         // Forget the failed attempt so start() / updateCredentials() retry it
         // (a cached failure would otherwise block every later ensure for good).
         if (this.#subs.get(key) === promise)

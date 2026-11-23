@@ -1,7 +1,7 @@
 /**
  * REST operations against `notification2/subscriptions` and `notification2/token`.
  */
-import { C8yHttpError } from './errors'
+import { C8yHttpError, C8ySubscriptionMismatchError } from './errors'
 import type { HttpClient } from './http'
 import type {
   NotificationTokenOptions,
@@ -20,16 +20,46 @@ const SUBSCRIPTIONS_PATH = 'notification2/subscriptions'
 export interface EnsureResult {
   /**
    * `true` if this call created the subscription; `false` if it already
-   * existed (HTTP 409) and the existing resource was returned instead. Note
-   * that after a 409 with no exact `(name, source)` match in the listing, the
-   * first subscription of that name is returned, so `subscription` may have a
-   * different source than requested.
+   * existed (HTTP 409) and the existing resource (same name and source), which
+   * matches the requested one, was returned instead. An existing subscription
+   * that differs (other context, `nonPersistent`, `apis`, `typeFilter`, or
+   * `fragmentsToCopy`) throws {@link C8ySubscriptionMismatchError} instead.
    */
   created: boolean
   subscription: SubscriptionResponse
 }
 const TOKEN_PATH = 'notification2/token'
 const UNSUBSCRIBE_PATH = 'notification2/unsubscribe'
+
+/**
+ * Names of the fields in which an existing subscription differs from the
+ * requested one. Missing values compare as their defaults (no source,
+ * `nonPersistent: false`, no apis, empty `typeFilter`, no `fragmentsToCopy`);
+ * `apis` and `fragmentsToCopy` compare as sets.
+ * @param existing
+ * @param requested
+ */
+function subscriptionMismatches(existing: Subscription, requested: Subscription): string[] {
+  const sameSet = (a: readonly string[] = [], b: readonly string[] = []): boolean => {
+    const sa = new Set(a)
+    const sb = new Set(b)
+    return sa.size === sb.size && [...sa].every((v) => sb.has(v))
+  }
+  const fields: string[] = []
+  if (existing.context !== requested.context)
+    fields.push('context')
+  if ((existing.source?.id ?? undefined) !== (requested.source?.id ?? undefined))
+    fields.push('source')
+  if ((existing.nonPersistent ?? false) !== (requested.nonPersistent ?? false))
+    fields.push('nonPersistent')
+  if (!sameSet(existing.subscriptionFilter?.apis, requested.subscriptionFilter?.apis))
+    fields.push('apis')
+  if ((existing.subscriptionFilter?.typeFilter ?? '') !== (requested.subscriptionFilter?.typeFilter ?? ''))
+    fields.push('typeFilter')
+  if (!sameSet(existing.fragmentsToCopy, requested.fragmentsToCopy))
+    fields.push('fragmentsToCopy')
+  return fields
+}
 
 /**
  * Typed REST API for managing Notification 2.0 subscriptions.
@@ -83,9 +113,13 @@ export class SubscriptionsApi {
   }
 
   /**
-   * Ensure a subscription exists. Mirrors the reference implementation's
-   * controller-helper: a create that returns HTTP 409 (conflict / already
-   * exists) is treated as success, and the existing subscription is returned.
+   * Ensure a subscription exists. A create that returns HTTP 409 (conflict /
+   * already exists) is treated as success, and the existing subscription is
+   * returned, as long as it matches the requested one. The platform's
+   * duplicate key is `(source, context, name)` and ignores the filter, so an
+   * existing subscription with a different context, `nonPersistent`, `apis`,
+   * `typeFilter`, or `fragmentsToCopy` throws
+   * {@link C8ySubscriptionMismatchError}; delete it to apply the new one.
    * Use {@link ensureDetailed} to learn whether it was created or adopted.
    * @param subscription
    */
@@ -96,7 +130,8 @@ export class SubscriptionsApi {
   /**
    * {@link ensure}, also reporting whether this call **created** the
    * subscription (`created: true`) or found an existing one after a 409
-   * (`created: false`) — so a caller can tell what it owns.
+   * (`created: false`) — so a caller can tell what it owns. Throws
+   * {@link C8ySubscriptionMismatchError} like {@link ensure}.
    * @param subscription
    */
   async ensureDetailed(subscription: Subscription): Promise<EnsureResult> {
@@ -114,13 +149,18 @@ export class SubscriptionsApi {
       source: subscription.source?.id,
       context: subscription.context,
     })
+    // Only an exact `(name, source)` match can be what caused the 409.
     const match = existing.subscriptions.find(
       (s) => s.subscription === subscription.subscription
         && (s.source?.id ?? undefined) === (subscription.source?.id ?? undefined),
-    ) ?? existing.subscriptions[0]
+    )
 
-    if (match)
+    if (match) {
+      const fields = subscriptionMismatches(match, subscription)
+      if (fields.length > 0)
+        throw new C8ySubscriptionMismatchError({ existing: match, requested: subscription, fields })
       return { created: false, subscription: match }
+    }
 
     // 409 without a discoverable existing resource: surface it honestly.
     if (data)

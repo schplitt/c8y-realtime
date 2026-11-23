@@ -780,7 +780,7 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
       }
       if (url.includes('notification2/subscriptions') && method === 'POST')
         return body.source?.id === '111' ? json({ error: 'exists' }, 409) : json({ id: 'mine', ...body }, 201)
-      return json({ subscriptions: [{ id: 'foreign', subscription: 'c8yRealtimeAlarms', context: 'mo', source: { id: '111' } }] })
+      return json({ subscriptions: [{ id: 'foreign', subscription: 'c8yRealtimeAlarms', context: 'mo', source: { id: '111' }, subscriptionFilter: { apis: ['alarms'] } }] })
     }) as unknown as typeof fetch
     const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false, deleteSubscriptionsOnClose: true })
     rt.alarms.onCreate('111', () => {}) // adopted via 409
@@ -805,7 +805,7 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
       }
       if (url.includes('notification2/subscriptions') && method === 'POST')
         return body.source?.id === '111' ? json({ error: 'exists' }, 409) : json({ id: `mine-${body.source?.id}`, ...body }, 201)
-      return json({ subscriptions: [{ id: 'foreign', subscription: 'c8yRealtimeAlarms', context: 'mo', source: { id: '111' } }] })
+      return json({ subscriptions: [{ id: 'foreign', subscription: 'c8yRealtimeAlarms', context: 'mo', source: { id: '111' }, subscriptionFilter: { apis: ['alarms'] } }] })
     }) as unknown as typeof fetch
     const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false })
     const offAdopted = rt.alarms.onCreate('111', () => {})
@@ -824,6 +824,40 @@ describe('realtimeClient — subscription lifecycle & labels', () => {
     await delay(10)
     expect(deleted).toEqual(['mine-222'])
     expect(rt.ownedSubscriptionIds).toEqual([]) // dropped once deleted
+    await rt.close()
+  })
+
+  it('a 409 with a mismatching existing subscription is logged with its id; nothing owned, other topics unaffected', async () => {
+    MockSocket.reset()
+    const errors: string[] = []
+    const posts: string[] = []
+    const fetchImpl = (async (url: string, init?: { method?: string, body?: string }) => {
+      const method = init?.method ?? 'GET'
+      const body = init?.body ? JSON.parse(init.body) as { subscription?: string, source?: { id: string } } : {}
+      if (url.includes('notification2/token'))
+        return json({ token: `tok-${body.subscription}` })
+      if (url.includes('notification2/subscriptions') && method === 'POST') {
+        posts.push(`${body.subscription}#${body.source?.id ?? '*'}`)
+        return body.source?.id === '111' ? json({ error: 'exists' }, 409) : json({ id: `mine-${body.subscription}-${body.source?.id ?? '*'}`, ...body }, 201)
+      }
+      // The existing one was created with other apis (e.g. by an earlier run).
+      return json({ subscriptions: [{ id: 'stale', subscription: 'c8yRealtimeAlarms', context: 'mo', source: { id: '111' }, subscriptionFilter: { apis: ['events'] } }] })
+    }) as unknown as typeof fetch
+    const rt = createRealtimeClient({ name: 'c8yRealtime', baseUrl: 'https://a.com', tenant: 't', user: 'u', password: 'p', webSocketImpl: MockSocket as unknown as WebSocketFactory, fetchImpl, autoStart: false, logger: { debug() {}, info() {}, warn() {}, error: (m) => errors.push(String(m)) } })
+    rt.alarms.onCreate('111', () => {}) // 409 → mismatch
+    rt.alarms.onCreate('222', () => {}) // same topic, other scope: created
+    rt.events.onCreate('*', () => {}) // other topic: created
+    await rt.start()
+    expect([...rt.ownedSubscriptionIds].sort()).toEqual(['mine-c8yRealtimeAlarms-222', 'mine-c8yRealtimeEvents-*'])
+    const mismatch = errors.filter((m) => m.includes('stale'))
+    expect(mismatch).toHaveLength(1)
+    expect(mismatch[0]).toContain('c8yRealtimeAlarms')
+    expect(mismatch[0]).toMatch(/delete/)
+    expect(errors.some((m) => /failed to ensure/.test(m))).toBe(false) // no double log
+    // The failed entry is forgotten: a later start() retries only that one.
+    await rt.start()
+    expect(posts.filter((p) => p === 'c8yRealtimeAlarms#111')).toHaveLength(2)
+    expect(posts.filter((p) => p !== 'c8yRealtimeAlarms#111')).toHaveLength(2)
     await rt.close()
   })
 
