@@ -29,7 +29,7 @@
 
 export { createNotificationClient, NotificationClient } from './client'
 export { WebSocketConsumer } from './consumer'
-export { C8yConnectionError, C8yError, C8yHttpError } from './errors'
+export { C8yConnectionError, C8yError, C8yHttpError, C8ySubscriptionMismatchError } from './errors'
 export { parseDescription, parseFrame, parsePayload } from './frame'
 export { basicAuthHeader, joinUrl, normalizeBaseUrl, toWebSocketUrl } from './http'
 export { createRealtimeClient, isValidRealtimeName, REALTIME_NAME_MIN_LENGTH, REALTIME_NAME_REGEX, RealtimeClient, toRealtimeName } from './realtime'

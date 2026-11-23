@@ -1,6 +1,7 @@
 /**
  * Typed error hierarchy for the Notification 2.0 SDK.
  */
+import type { Subscription, SubscriptionResponse } from './types'
 
 /**
  * Base class for all errors thrown by this SDK.
@@ -53,3 +54,30 @@ export class C8yHttpError extends C8yError {
  * Thrown when the consumer connection cannot be established or recovered.
  */
 export class C8yConnectionError extends C8yError {}
+
+/**
+ * Thrown by `ensure()` / `ensureDetailed()` when the create returns HTTP 409
+ * and the existing subscription (same name and source) differs from the
+ * requested one (context, `nonPersistent`, `apis`, `typeFilter`, or
+ * `fragmentsToCopy`). The
+ * platform's duplicate key ignores the filter, so the existing subscription
+ * must be deleted before the requested one can be created.
+ */
+export class C8ySubscriptionMismatchError extends C8yError {
+  /**
+   * The subscription that already exists on the platform.
+   */
+  readonly existing: SubscriptionResponse
+  /**
+   * The subscription that was requested.
+   */
+  readonly requested: Subscription
+
+  constructor(params: { existing: SubscriptionResponse, requested: Subscription, fields: readonly string[] }) {
+    super(
+      `subscription "${params.requested.subscription}" already exists as ${params.existing.id} with a different ${params.fields.join(', ')}; delete it to apply the requested one`,
+    )
+    this.existing = params.existing
+    this.requested = params.requested
+  }
+}

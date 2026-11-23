@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { HttpClient } from '../../src/http'
+import { C8yHttpError, C8ySubscriptionMismatchError } from '../../src/errors'
 import { createToken, SubscriptionsApi } from '../../src/subscriptions'
+import type { Subscription, SubscriptionResponse } from '../../src/types'
 
 type FetchInit = NonNullable<Parameters<typeof fetch>[1]>
 
@@ -75,6 +77,87 @@ describe('subscriptionsApi.ensureDetailed', () => {
     const second = await api.ensureDetailed({ context: 'tenant', subscription: 'demo' })
     expect(second.created).toBe(false)
     expect(second.subscription.id).toBe('1')
+  })
+})
+
+describe('subscriptionsApi.ensureDetailed — existing subscription mismatch', () => {
+  const requested: Subscription = {
+    context: 'mo',
+    subscription: 'demo',
+    source: { id: '1' },
+    nonPersistent: false,
+    subscriptionFilter: { apis: ['alarms', 'events'], typeFilter: '\'a\' or \'b\'' },
+    fragmentsToCopy: ['c8y_A', 'c8y_B'],
+  }
+
+  function conflictWith(existing: SubscriptionResponse[]) {
+    return makeApi((method) => method === 'POST' ? jsonResponse({}, 409) : jsonResponse({ subscriptions: existing })).api
+  }
+
+  it('returns a matching existing subscription with created: false', async () => {
+    const existing = { id: 'x', ...requested }
+    const result = await conflictWith([existing]).ensureDetailed(requested)
+    expect(result).toEqual({ created: false, subscription: existing })
+  })
+
+  it('treats apis/fragmentsToCopy order and missing-vs-default values as equal', async () => {
+    const existing: SubscriptionResponse = {
+      id: 'x',
+      context: 'mo',
+      subscription: 'demo',
+      source: { id: '1' },
+      subscriptionFilter: { apis: ['events', 'alarms', 'alarms'], typeFilter: '\'a\' or \'b\'' },
+      fragmentsToCopy: ['c8y_B', 'c8y_A'],
+    }
+    await expect(conflictWith([existing]).ensureDetailed(requested)).resolves.toMatchObject({ created: false })
+
+    const bare: Subscription = { context: 'tenant', subscription: 'demo' }
+    const explicitDefaults: SubscriptionResponse = {
+      id: 'y',
+      context: 'tenant',
+      subscription: 'demo',
+      nonPersistent: false,
+      subscriptionFilter: { apis: [], typeFilter: '' },
+      fragmentsToCopy: [],
+    }
+    await expect(conflictWith([explicitDefaults]).ensureDetailed(bare)).resolves.toMatchObject({ created: false })
+    const { id: _id, ...explicitRequest } = explicitDefaults
+    await expect(conflictWith([{ id: 'z', ...bare }]).ensureDetailed(explicitRequest)).resolves.toMatchObject({ created: false })
+  })
+
+  const differing: [string, Partial<Subscription>][] = [
+    ['context', { context: 'tenant' }],
+    ['nonPersistent', { nonPersistent: true }],
+    ['apis', { subscriptionFilter: { apis: ['alarms'], typeFilter: '\'a\' or \'b\'' } }],
+    ['typeFilter', { subscriptionFilter: { apis: ['alarms', 'events'], typeFilter: '\'a\'' } }],
+    ['fragmentsToCopy', { fragmentsToCopy: ['c8y_A'] }],
+  ]
+  for (const [field, change] of differing) {
+    it(`throws C8ySubscriptionMismatchError when ${field} differs`, async () => {
+      const existing: SubscriptionResponse = { id: 'stale', ...requested, ...change }
+      const error = await conflictWith([existing]).ensureDetailed(requested).catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(C8ySubscriptionMismatchError)
+      const mismatch = error as C8ySubscriptionMismatchError
+      expect(mismatch.existing).toEqual(existing)
+      expect(mismatch.requested).toEqual(requested)
+      expect(mismatch.message).toContain('demo')
+      expect(mismatch.message).toContain('stale')
+      expect(mismatch.message).toContain(field)
+    })
+  }
+
+  it('ensure() throws the same error', async () => {
+    const existing: SubscriptionResponse = { id: 'stale', ...requested, nonPersistent: true }
+    await expect(conflictWith([existing]).ensure(requested)).rejects.toBeInstanceOf(C8ySubscriptionMismatchError)
+  })
+
+  it('does not adopt or blame a same-name subscription with a different source: plain 409', async () => {
+    const existing: SubscriptionResponse = { id: 'other', ...requested, source: { id: '999' } }
+    const { api } = makeApi((method) => method === 'POST' ? new Response('', { status: 409 }) : jsonResponse({ subscriptions: [existing] }))
+    const error = await api.ensureDetailed(requested).catch((e: unknown) => e)
+    expect(error).not.toBeInstanceOf(C8ySubscriptionMismatchError)
+    expect(error).toBeInstanceOf(C8yHttpError)
+    expect((error as C8yHttpError).status).toBe(409)
   })
 })
 
