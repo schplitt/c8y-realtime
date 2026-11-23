@@ -57,7 +57,8 @@ export class C8yConnectionError extends C8yError {}
 
 /**
  * Thrown by `ensure()` / `ensureDetailed()` when the create returns HTTP 409
- * and the existing subscription (same name and source) differs from the
+ * and the existing subscription (same name and source; name only for a
+ * tenant subscription requested without a source) differs from the
  * requested one (context, `nonPersistent`, `apis`, `typeFilter`, or
  * `fragmentsToCopy`). The
  * platform's duplicate key ignores the filter, so the existing subscription

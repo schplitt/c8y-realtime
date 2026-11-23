@@ -20,9 +20,10 @@ const SUBSCRIPTIONS_PATH = 'notification2/subscriptions'
 export interface EnsureResult {
   /**
    * `true` if this call created the subscription; `false` if it already
-   * existed (HTTP 409) and the existing resource (same name and source), which
-   * matches the requested one, was returned instead. An existing subscription
-   * that differs (other context, `nonPersistent`, `apis`, `typeFilter`, or
+   * existed (HTTP 409) and the existing resource (same name and source; name
+   * only for a tenant subscription requested without a source), which matches
+   * the requested one, was returned instead. An existing subscription that
+   * differs (other context, `nonPersistent`, `apis`, `typeFilter`, or
    * `fragmentsToCopy`) throws {@link C8ySubscriptionMismatchError} instead.
    */
   created: boolean
@@ -33,8 +34,8 @@ const UNSUBSCRIBE_PATH = 'notification2/unsubscribe'
 
 /**
  * Names of the fields in which an existing subscription differs from the
- * requested one. Missing values compare as their defaults (no source,
- * `nonPersistent: false`, no apis, empty `typeFilter`, no `fragmentsToCopy`);
+ * requested one. Missing values compare as their defaults
+ * (`nonPersistent: false`, no apis, empty `typeFilter`, no `fragmentsToCopy`);
  * `apis` and `fragmentsToCopy` compare as sets.
  * @param existing
  * @param requested
@@ -48,8 +49,6 @@ function subscriptionMismatches(existing: Subscription, requested: Subscription)
   const fields: string[] = []
   if (existing.context !== requested.context)
     fields.push('context')
-  if ((existing.source?.id ?? undefined) !== (requested.source?.id ?? undefined))
-    fields.push('source')
   if ((existing.nonPersistent ?? false) !== (requested.nonPersistent ?? false))
     fields.push('nonPersistent')
   if (!sameSet(existing.subscriptionFilter?.apis, requested.subscriptionFilter?.apis))
@@ -120,6 +119,10 @@ export class SubscriptionsApi {
    * existing subscription with a different context, `nonPersistent`, `apis`,
    * `typeFilter`, or `fragmentsToCopy` throws
    * {@link C8ySubscriptionMismatchError}; delete it to apply the new one.
+   * The existing subscription is found by name and source (name only for a
+   * tenant subscription requested without a source, since the platform fills
+   * in its source). A 409 with no matching existing subscription throws a
+   * plain 409 {@link C8yHttpError}.
    * Use {@link ensureDetailed} to learn whether it was created or adopted.
    * @param subscription
    */
@@ -131,7 +134,8 @@ export class SubscriptionsApi {
    * {@link ensure}, also reporting whether this call **created** the
    * subscription (`created: true`) or found an existing one after a 409
    * (`created: false`) — so a caller can tell what it owns. Throws
-   * {@link C8ySubscriptionMismatchError} like {@link ensure}.
+   * {@link C8ySubscriptionMismatchError} and a plain 409 {@link C8yHttpError}
+   * like {@link ensure}.
    * @param subscription
    */
   async ensureDetailed(subscription: Subscription): Promise<EnsureResult> {
@@ -149,10 +153,13 @@ export class SubscriptionsApi {
       source: subscription.source?.id,
       context: subscription.context,
     })
-    // Only an exact `(name, source)` match can be what caused the 409.
+    // Only an exact `(name, source)` match can be what caused the 409, except
+    // for a tenant subscription requested without a source: the platform fills
+    // in its source itself (the tenant as a managed object), so match by name.
     const match = existing.subscriptions.find(
       (s) => s.subscription === subscription.subscription
-        && (s.source?.id ?? undefined) === (subscription.source?.id ?? undefined),
+        && ((subscription.context === 'tenant' && subscription.source === undefined)
+          || (s.source?.id ?? undefined) === (subscription.source?.id ?? undefined)),
     )
 
     if (match) {
@@ -163,8 +170,6 @@ export class SubscriptionsApi {
     }
 
     // 409 without a discoverable existing resource: surface it honestly.
-    if (data)
-      return { created: false, subscription: data }
     throw new C8yHttpError({
       status: 409,
       statusText: 'Conflict',
